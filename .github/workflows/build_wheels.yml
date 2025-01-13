@@ -3,9 +3,6 @@ name: Wheels
 on:
   push:
   pull_request:
-    paths-ignore:
-      - "docs/**"
-      - "CONTRIBUTING.md"
   release:
     types:
       - published
@@ -18,88 +15,190 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build_wheels:
-    name: Wheel for Linux-${{ matrix.cibw_python }}-${{ matrix.cibw_arch }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest]
-        cibw_python: ["cp37-*", "cp38-*", "cp39-*", "cp310-*", "cp311-*"]
-        cibw_arch: ["x86_64", "i686"]
-
-    steps:
-      - uses: actions/checkout@v3
-      - name: Disable ptrace security restrictions
-        run: |
-          echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
-      - name: Build wheels
-        uses: pypa/cibuildwheel@v2.13.0
-        env:
-          CIBW_BUILD: ${{ matrix.cibw_python }}
-          CIBW_ARCHS_LINUX: ${{ matrix.cibw_arch }}
-          CIBW_PRERELEASE_PYTHONS: True
-          CIBW_TEST_EXTRAS: test
-          CIBW_TEST_COMMAND: python -m pytest {package}/tests
-      - uses: actions/upload-artifact@v3
-        with:
-          path: ./wheelhouse/*.whl
-
-  build_wheels_macos:
-    name: Wheel for MacOS-${{ matrix.cibw_python }}-${{ matrix.cibw_arch }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-11]
-        cibw_python: ["cp38-*", "cp39-*", "cp310-*", "cp311-*"]
-        cibw_arch: ["x86_64", "arm64"]
-
-    steps:
-      - uses: actions/checkout@v3
-      - name: Sets env vars for compilation
-        if: matrix.cibw_arch == 'arm64'
-        run: |
-          echo "CFLAGS=-target arm64-apple-macos11" >> $GITHUB_ENV
-          echo "MEMRAY_LIBBACKTRACE_TARGET=arm64-apple-macos11" >> $GITHUB_ENV
-      - name: Build wheels
-        uses: pypa/cibuildwheel@v2.13.0
-        env:
-          CIBW_BUILD: ${{ matrix.cibw_python }}
-          CIBW_ARCHS_MACOS: ${{ matrix.cibw_arch }}
-          CIBW_PRERELEASE_PYTHONS: True
-          CIBW_TEST_EXTRAS: test
-          CIBW_TEST_COMMAND: pytest {package}/tests
-          CIBW_BUILD_VERBOSITY: 1
-          MACOSX_DEPLOYMENT_TARGET: "10.14"
-
-      - uses: actions/upload-artifact@v3
-        with:
-          path: ./wheelhouse/*.whl
-
   build_sdist:
     name: Build source distribution
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Build sdist
         run: pipx run build --sdist
 
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         with:
-          path: dist/*.tar.gz
+          name: sdist
+          path: dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tests
+          path: tests
+
+  choose_linux_wheel_types:
+    name: Decide which wheel types to build
+    runs-on: ubuntu-latest
+    steps:
+      - id: manylinux_x86_64
+        run: echo "wheel_types=manylinux_x86_64" >> $GITHUB_OUTPUT
+      - id: musllinux_x86_64
+        run: echo "wheel_types=musllinux_x86_64" >> $GITHUB_OUTPUT
+      - id: manylinux_i686
+        run: echo "wheel_types=manylinux_i686" >> $GITHUB_OUTPUT
+      - id: manylinux_aarch64
+        if: github.event_name == 'release' && github.event.action == 'published'
+        run: echo "wheel_types=manylinux_aarch64" >> $GITHUB_OUTPUT
+    outputs:
+      wheel_types: ${{ toJSON(steps.*.outputs.wheel_types) }}
+
+  build_linux_wheels:
+    needs: [build_sdist, choose_linux_wheel_types]
+    name: ${{ matrix.wheel_type }}${{ matrix.manylinux2010_hack }} wheels
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        wheel_type: ${{ fromJSON(needs.choose_linux_wheel_types.outputs.wheel_types) }}
+        manylinux2010_hack: [""]
+        include:
+          - wheel_type: manylinux_x86_64
+            manylinux2010_hack: "_manylinux2010_hack"
+    steps:
+      - name: Build manylinux2010 image containing Python 3.11 and 3.12
+        if: matrix.manylinux2010_hack
+        run: |
+          echo "CIBW_SKIP=*cp3{7,8,9,10,13}*" >> $GITHUB_ENV
+          echo "CIBW_MANYLINUX_X86_64_IMAGE=manylinux2010-with-modern-cpython" >> $GITHUB_ENV
+          docker build -t manylinux2010-with-modern-cpython - <<'EOF'
+          # syntax=docker/dockerfile:1
+          FROM quay.io/pypa/manylinux2010_x86_64:latest
+          RUN curl https://pyenv.run | bash && \
+           export PYENV_ROOT="$HOME/.pyenv" && \
+           export PATH="$PYENV_ROOT/bin:$PATH" && \
+           eval "$(pyenv init -)" && \
+           yum install -y make patch zlib-devel bzip2 bzip2-devel readline-devel sqlite sqlite-devel openssl-devel tk-devel libffi-devel xz-devel perl-IPC-Cmd && \
+           curl -L https://www.openssl.org/source/openssl-3.0.12.tar.gz >openssl-3.0.12.tar.gz && \
+           tar xzf openssl-3.0.12.tar.gz && \
+           (cd openssl-3.0.12 && ./config no-shared --prefix=/usr/local/ssl --openssldir=/usr/local/ssl --libdir=lib && make && make install_sw) && \
+           rm -rf openssl-3.0.12.tar.gz && \
+           rm -rf openssl-3.0.12 && \
+           PYTHON_CONFIGURE_OPTS=--with-openssl=/usr/local/ssl pyenv install 3.11 && \
+           ln -s /root/.pyenv/versions/3.11* /opt/python/cp311-cp311 && \
+           PYTHON_CONFIGURE_OPTS=--with-openssl=/usr/local/ssl pyenv install 3.12 && \
+           ln -s /root/.pyenv/versions/3.12* /opt/python/cp312-cp312 && \
+           true
+          EOF
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: tests
+          path: tests
+      - uses: docker/setup-qemu-action@v3
+        if: runner.os == 'Linux'
+        name: Set up QEMU
+      - name: Extract sdist
+        run: |
+          tar zxvf dist/*.tar.gz --strip-components=1
+      - name: Disable ptrace security restrictions
+        run: |
+          echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.22.0
+        env:
+          CIBW_BUILD: "cp3{7..13}-${{ matrix.wheel_type }}"
+          CIBW_ARCHS_LINUX: auto aarch64
+          CIBW_PRERELEASE_PYTHONS: True
+          CIBW_TEST_EXTRAS: test
+          CIBW_TEST_COMMAND: python -m pytest {package}/tests
+          CIBW_TEST_SKIP: "*aarch64*"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.wheel_type }}${{ matrix.manylinux2010_hack }}-wheels
+          path: ./wheelhouse/*.whl
+
+  build_macosx_wheels:
+    needs: [build_sdist]
+    name: macosx_${{ matrix.arch }} wheels
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: macos-13
+            arch: x86_64
+          - os: macos-14
+            arch: arm64
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: tests
+          path: tests
+      - name: Extract sdist
+        run: |
+          tar zxvf dist/*.tar.gz --strip-components=1
+      - name: Sets env vars for compilation
+        run: |
+          echo "LZ4_INSTALL_DIR=/tmp/lz4_install" >> $GITHUB_ENV
+          echo "CFLAGS=-arch ${{matrix.arch}}" >> $GITHUB_ENV
+      - name: Set x86_64-specific environment variables
+        if: matrix.arch == 'x86_64'
+        run: |
+          echo "MACOSX_DEPLOYMENT_TARGET=10.14" >> $GITHUB_ENV
+      - name: Set arm64-specific environment variables
+        if: matrix.arch == 'arm64'
+        run: |
+          echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> $GITHUB_ENV
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.22.0
+        env:
+          CIBW_BUILD: "cp3{8..13}-*"
+          CIBW_PRERELEASE_PYTHONS: True
+          CIBW_TEST_EXTRAS: test
+          CIBW_TEST_COMMAND: pytest {package}/tests
+          CIBW_BUILD_VERBOSITY: 1
+          CFLAGS: "${{env.CFLAGS}} -I${{env.LZ4_INSTALL_DIR}}/include"
+          LDFLAGS: "-L${{env.LZ4_INSTALL_DIR}}/lib -Wl,-rpath,${{env.LZ4_INSTALL_DIR}}/lib"
+          PKG_CONFIG_PATH: "${{env.LZ4_INSTALL_DIR}}/lib/pkgconfig"
+          CIBW_REPAIR_WHEEL_COMMAND_MACOS: "DYLD_LIBRARY_PATH=${{env.LZ4_INSTALL_DIR}}/lib delocate-wheel --require-archs {delocate_archs} -w {dest_dir} -v {wheel}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macosx_${{ matrix.arch }}-wheels
+          path: ./wheelhouse/*.whl
+
+  build_and_test_wheels:
+    name: Build and test wheels
+    needs: [build_linux_wheels, build_macosx_wheels]
+    runs-on: ubuntu-latest
+    if: always() # Don't skip this step if a predecessor failed!
+    steps:
+      # We can't make a matrix job itself a required check in GitHub,
+      # so we instead add a job that depends on the two matrix jobs,
+      # and we mark this job as required instead. This job doesn't do
+      # any work, it just lets us better manage our required checks.
+      - if: "!success()"
+        run: echo "Some builds failed" && exit 1
+      - run: echo "All builds succeeded!"
 
   upload_pypi:
-    needs: [build_wheels, build_wheels_macos, build_sdist]
+    needs: [build_and_test_wheels, build_sdist]
     runs-on: ubuntu-latest
     if: github.event_name == 'release' && github.event.action == 'published'
     steps:
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with:
-          name: artifact
+          # with no name set, it downloads all of the artifacts
           path: dist
-
+      - run: |
+          mv dist/sdist/*.tar.gz dist/
+          mv dist/*-wheels/*.whl dist/
+          rmdir dist/{sdist,*-wheels}
+          rm -r dist/tests
+          ls -R dist
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           skip_existing: true

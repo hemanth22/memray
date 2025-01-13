@@ -112,8 +112,17 @@ def _wait_until_process_blocks(pid: int) -> None:
         time.sleep(0.1)
 
 
-def generate_sample_results(tmp_path, code, *, native=False):
+def generate_sample_results(
+    tmp_path,
+    code,
+    *,
+    native=False,
+    trace_python_allocators=False,
+    disable_pymalloc=False,
+):
     results_file = tmp_path / "result.bin"
+    env = os.environ.copy()
+    env["PYTHONMALLOC"] = "malloc" if disable_pymalloc else "pymalloc"
     subprocess.run(
         [
             sys.executable,
@@ -121,6 +130,7 @@ def generate_sample_results(tmp_path, code, *, native=False):
             "memray",
             "run",
             *(["--native"] if native else []),
+            *(["--trace-python-allocators"] if trace_python_allocators else []),
             "--output",
             str(results_file),
             str(code),
@@ -129,6 +139,7 @@ def generate_sample_results(tmp_path, code, *, native=False):
         check=True,
         capture_output=True,
         text=True,
+        env=env,
     )
     return results_file, code
 
@@ -257,9 +268,7 @@ class TestRunSubcommand:
         # GIVEN
         out_file = tmp_path / "result.bin"
         target_file = tmp_path / "test.py"
-        target_file.write_text("import some_adjacent_module")
-        other_file = tmp_path / "some_adjacent_module.py"
-        other_file.write_text("import sys; print(sys.argv); print(sys.path[0])")
+        target_file.write_text("import json, sys; print(json.dumps(sys.path))")
 
         # WHEN
         proc = subprocess.run(
@@ -281,57 +290,127 @@ class TestRunSubcommand:
         )
 
         # THEN
-        assert proc.returncode == 0
-        argv, path0 = proc.stdout.splitlines()
-        assert argv == repr([str(target_file), "some", "provided args"])
-        assert path0 == str(tmp_path)
         assert out_file.exists()
+        assert proc.returncode == 0
+        # Running `python -m` put cwd in sys.path; ensure we replaced it.
+        path = json.loads(proc.stdout)
+        assert os.getcwd() not in path
+        assert str(tmp_path) in path
 
-    def test_sys_manipulations_when_running_module(self, tmp_path):
+    @pytest.mark.parametrize(
+        "isolation_flag", ["-I"] + (["-P"] if sys.version_info > (3, 11) else [])
+    )
+    def test_suppressing_sys_manipulations_when_running_script(
+        self, tmp_path, isolation_flag
+    ):
         # GIVEN
         out_file = tmp_path / "result.bin"
         target_file = tmp_path / "test.py"
-        target_file.write_text("import some_adjacent_module")
-        other_file = tmp_path / "some_adjacent_module.py"
-        other_file.write_text("import sys; print(sys.argv); print(sys.path[0])")
-        env = os.environ.copy()
-        env["PYTHONPATH"] = str(tmp_path) + ":" + os.environ.get("PYTHONPATH", "")
+        target_file.write_text("import json, sys; print(json.dumps(sys.path))")
 
         # WHEN
         proc = subprocess.run(
             [
                 sys.executable,
+                isolation_flag,
                 "-m",
                 "memray",
                 "run",
                 "--quiet",
                 "--output",
                 str(out_file),
-                "-m",
-                "test",
+                str(target_file),
                 "some",
                 "provided args",
             ],
             check=True,
             capture_output=True,
             text=True,
-            env=env,
         )
 
         # THEN
-        assert proc.returncode == 0
-        argv, path0 = proc.stdout.splitlines()
-        assert argv == repr([str(target_file), "some", "provided args"])
-        assert path0 == os.getcwd()
         assert out_file.exists()
+        assert proc.returncode == 0
+        # Running `python -m` did not put cwd in sys.path; ensure it isn't
+        # there, and neither is the tmp_path we would have replaced it with.
+        path = json.loads(proc.stdout)
+        assert os.getcwd() not in path
+        assert str(tmp_path) not in path
+
+    def test_sys_manipulations_when_running_module(self, tmp_path):
+        # GIVEN
+        out_file = tmp_path / "result.bin"
+
+        # WHEN
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys; from memray.commands import main; sys.exit(main())",
+                "run",
+                "--quiet",
+                "--output",
+                str(out_file),
+                "-m",
+                "site",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        # THEN
+        assert out_file.exists()
+        assert proc.returncode == 0
+        # Running `python -c` put "" in sys.path; ensure we replaced it.
+        path = eval(
+            " ".join(line for line in proc.stdout.splitlines() if line.startswith(" "))
+        )
+        assert "" not in path
+        assert os.getcwd() in path
+
+    @pytest.mark.parametrize(
+        "isolation_flag", ["-I"] + (["-P"] if sys.version_info > (3, 11) else [])
+    )
+    def test_suppressing_sys_manipulations_when_running_module(
+        self, tmp_path, isolation_flag
+    ):
+        # GIVEN
+        out_file = tmp_path / "result.bin"
+
+        # WHEN
+        proc = subprocess.run(
+            [
+                sys.executable,
+                isolation_flag,
+                "-c",
+                "import sys; from memray.commands import main; sys.exit(main())",
+                "run",
+                "--quiet",
+                "--output",
+                str(out_file),
+                "-m",
+                "site",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        # THEN
+        assert out_file.exists()
+        assert proc.returncode == 0
+        # Running `python -c` did not put "" in sys.path; ensure it isn't
+        # there, and neither is the os.getcwd() we would have replaced it with.
+        path = eval(
+            " ".join(line for line in proc.stdout.splitlines() if line.startswith(" "))
+        )
+        assert "" not in path
+        assert os.getcwd() not in path
 
     def test_sys_manipulations_when_running_cmd(self, tmp_path):
         # GIVEN
         out_file = tmp_path / "result.bin"
-        other_file = tmp_path / "some_adjacent_module.py"
-        other_file.write_text("import sys; print(sys.argv); print(sys.path[0])")
-        env = os.environ.copy()
-        env["PYTHONPATH"] = str(tmp_path) + ":" + os.environ.get("PYTHONPATH", "")
 
         # WHEN
         proc = subprocess.run(
@@ -344,22 +423,57 @@ class TestRunSubcommand:
                 "--output",
                 str(out_file),
                 "-c",
-                "import some_adjacent_module",
-                "some",
-                "provided args",
+                "import json, sys; print(json.dumps(sys.path))",
             ],
             check=True,
             capture_output=True,
             text=True,
-            env=env,
         )
 
         # THEN
-        assert proc.returncode == 0
-        argv, path0 = proc.stdout.splitlines()
-        assert argv == repr(["-c", "some", "provided args"])
-        assert path0 == ""
         assert out_file.exists()
+        assert proc.returncode == 0
+        # Running `python -m` put cwd in sys.path; ensure we replaced it.
+        path = json.loads(proc.stdout)
+        assert os.getcwd() not in path
+        assert "" in path
+
+    @pytest.mark.parametrize(
+        "isolation_flag", ["-I"] + (["-P"] if sys.version_info > (3, 11) else [])
+    )
+    def test_suppressing_sys_manipulations_when_running_cmd(
+        self, tmp_path, isolation_flag
+    ):
+        # GIVEN
+        out_file = tmp_path / "result.bin"
+
+        # WHEN
+        proc = subprocess.run(
+            [
+                sys.executable,
+                isolation_flag,
+                "-m",
+                "memray",
+                "run",
+                "--quiet",
+                "--output",
+                str(out_file),
+                "-c",
+                "import json, sys; print(json.dumps(sys.path))",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        # THEN
+        assert out_file.exists()
+        assert proc.returncode == 0
+        # Running `python -m` did not put cwd in sys.path; ensure it isn't
+        # there, and neither is the "" we would have replaced it with.
+        path = json.loads(proc.stdout)
+        assert os.getcwd() not in path
+        assert "" not in path
 
     @pytest.mark.parametrize("option", [None, "--live", "--live-remote"])
     def test_run_file_that_is_not_python(self, capsys, option):
@@ -512,7 +626,7 @@ class TestParseSubcommand:
         for record in records:
             record_count_by_type[record.partition(" ")[0]] += 1
 
-        for _, count in record_count_by_type.items():
+        for count in record_count_by_type.values():
             assert count > 0
 
     def test_successful_parse_of_aggregated_capture_file(self, tmp_path):
@@ -571,7 +685,7 @@ class TestParseSubcommand:
         for record in records:
             record_count_by_type[record.partition(" ")[0]] += 1
 
-        for _, count in record_count_by_type.items():
+        for count in record_count_by_type.values():
             assert count > 0
 
     def test_error_when_stdout_is_a_tty(self, tmp_path, simple_test_file):
@@ -750,6 +864,48 @@ class TestFlamegraphSubCommand:
         assert output_file.exists()
         assert str(source_file) in output_file.read_text()
 
+    @pytest.mark.parametrize("trace_python_allocators", [True, False])
+    @pytest.mark.parametrize("disable_pymalloc", [True, False])
+    def test_leaks_with_pymalloc_warning(
+        self,
+        tmp_path,
+        simple_test_file,
+        trace_python_allocators,
+        disable_pymalloc,
+    ):
+        results_file, _ = generate_sample_results(
+            tmp_path,
+            simple_test_file,
+            native=True,
+            trace_python_allocators=trace_python_allocators,
+            disable_pymalloc=disable_pymalloc,
+        )
+        output_file = tmp_path / "output.html"
+        warning_expected = not trace_python_allocators and not disable_pymalloc
+
+        # WHEN
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "memray",
+                "flamegraph",
+                "--leaks",
+                str(results_file),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        # THEN
+        output_file = tmp_path / "memray-flamegraph-result.html"
+        assert output_file.exists()
+        assert warning_expected == (
+            'Report generated using "--leaks" using pymalloc allocator'
+            in output_file.read_text()
+        )
+
 
 class TestSummarySubCommand:
     def test_summary_generated(self, tmp_path, simple_test_file):
@@ -802,6 +958,8 @@ class TestTreeSubCommand:
         results_file, _ = generate_sample_results(
             tmp_path, simple_test_file, native=True
         )
+        env = os.environ.copy()
+        env["TEXTUAL_PRESS"] = "q"
 
         # WHEN
         output = subprocess.check_output(
@@ -813,15 +971,19 @@ class TestTreeSubCommand:
                 str(results_file),
             ],
             cwd=str(tmp_path),
+            stderr=subprocess.DEVNULL,
             text=True,
+            env=env,
         )
 
         # THEN
-        assert "frames hidden" in output
+        assert output
 
     def test_temporary_allocations_tree(self, tmp_path, simple_test_file):
         # GIVEN
         results_file, _ = generate_sample_results(tmp_path, simple_test_file)
+        env = os.environ.copy()
+        env["TEXTUAL_PRESS"] = "q"
 
         # WHEN
         output = subprocess.check_output(
@@ -834,7 +996,9 @@ class TestTreeSubCommand:
                 str(results_file),
             ],
             cwd=str(tmp_path),
+            stderr=subprocess.DEVNULL,
             text=True,
+            env=env,
         )
 
         # THEN
@@ -1254,6 +1418,8 @@ class TestLiveRemoteSubcommand:
                 "live",
                 str(free_port),
             ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             stdin=subprocess.PIPE,
         )
 
@@ -1376,6 +1542,8 @@ class TestLiveRemoteSubcommand:
                 str(free_port),
             ],
             stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
         )
 
         # WHEN
@@ -1492,43 +1660,6 @@ class TestLiveSubcommand:
 
         # THEN
         assert server.returncode == 0
-
-    def test_live_tracking_server_exits_properly_on_sigint(self, tmp_path):
-        # GIVEN
-        with track_and_wait(tmp_path) as program_file:
-            server = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-m",
-                    "memray",
-                    "run",
-                    "--live",
-                    str(program_file),
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env={"PYTHONUNBUFFERED": "1"},
-                # Explicitly reset the signal handler for SIGINT to work around any signal
-                # masking that might happen on Jenkins.
-                preexec_fn=lambda: signal.signal(
-                    signal.SIGINT, signal.default_int_handler
-                ),
-            )
-
-        # WHEN
-
-        server.send_signal(signal.SIGINT)
-        try:
-            _, stderr = server.communicate(timeout=TIMEOUT)
-        except subprocess.TimeoutExpired:
-            server.kill()
-            raise
-
-        # THEN
-        assert server.returncode == 0
-        assert not stderr
-        assert b"Exception ignored" not in stderr
-        assert b"KeyboardInterrupt" not in stderr
 
 
 class TestTransformSubCommands:

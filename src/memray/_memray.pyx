@@ -2,6 +2,7 @@ import collections
 import contextlib
 import os
 import pathlib
+import platform
 import sys
 
 cimport cython
@@ -55,6 +56,7 @@ from _memray.source cimport SocketSource
 from _memray.tracking_api cimport Tracker as NativeTracker
 from _memray.tracking_api cimport install_trace_function
 from cpython cimport PyErr_CheckSignals
+from libc.math cimport ceil
 from libc.stdint cimport uint64_t
 from libcpp cimport bool
 from libcpp.limits cimport numeric_limits
@@ -72,6 +74,19 @@ from ._destination import FileDestination
 from ._destination import SocketDestination
 from ._metadata import Metadata
 from ._stats import Stats
+from ._thread_name_interceptor import ThreadNameInterceptor
+
+
+cdef extern from "pthread.h" nogil:
+    int pthread_atfork(void (*prepare)(), void (*parent)(), void (*child)())
+
+# NOTE: We can't reinitialize tracking in a child process until the interpreter
+#       has reinitialized its locks, so we do it in a Python fork handler.
+#       But, Python fork handlers aren't guaranteed to run for every fork, and
+#       the child process must never inherit an active tracker, so we must use
+#       a pthread fork handler to disable tracking before forking.
+pthread_atfork(&NativeTracker.prepareFork, &NativeTracker.parentFork, NULL)
+os.register_at_fork(after_in_child=NativeTracker.childFork)
 
 
 def set_log_level(int level):
@@ -304,9 +319,7 @@ cdef class AllocationRecord:
         if self.tid == -1:
             return "merged thread"
         assert self._reader.get() != NULL, "Cannot get thread name without reader."
-        cdef object name = self._reader.get().getThreadName(self.tid)
-        thread_id = hex(self.tid)
-        return f"{thread_id} ({name})" if name else f"{thread_id}"
+        return self._reader.get().getThreadName(self.tid)
 
     def stack_trace(self, max_stacks=None):
         cache_key = ("python", max_stacks)
@@ -439,9 +452,7 @@ cdef class TemporalAllocationRecord:
     @property
     def thread_name(self):
         assert self._reader.get() != NULL, "Cannot get thread name without reader."
-        cdef object name = self._reader.get().getThreadName(self.tid)
-        thread_id = hex(self.tid)
-        return f"{thread_id} ({name})" if name else f"{thread_id}"
+        return self._reader.get().getThreadName(self.tid)
 
     def stack_trace(self, max_stacks=None):
         cache_key = ("python", max_stacks)
@@ -570,6 +581,9 @@ cdef class ProfileFunctionGuard:
         NativeTracker.forgetPythonStack()
 
 
+tracker_creation_lock = threading.Lock()
+
+
 cdef class Tracker:
     """Context manager for tracking memory allocations in a Python script.
 
@@ -673,41 +687,54 @@ cdef class Tracker:
                 command_line,
                 native_traces,
                 file_format,
+                trace_python_allocators,
             )
         )
 
     @cython.profile(False)
     def __enter__(self):
-
-        if NativeTracker.getTracker() != NULL:
-            raise RuntimeError("No more than one Tracker instance can be active at the same time")
-
         cdef unique_ptr[RecordWriter] writer
-        if self._writer == NULL:
-            raise RuntimeError("Attempting to use stale output handle")
-        writer = move(self._writer)
+        with tracker_creation_lock:
+            if NativeTracker.getTracker() != NULL:
+                raise RuntimeError("No more than one Tracker instance can be active at the same time")
 
-        self._previous_profile_func = sys.getprofile()
-        self._previous_thread_profile_func = threading._profile_hook
-        threading.setprofile(start_thread_trace)
+            if self._writer == NULL:
+                raise RuntimeError("Attempting to use stale output handle")
+            writer = move(self._writer)
 
-        if "greenlet._greenlet" in sys.modules:
-            NativeTracker.beginTrackingGreenlets()
+            for attr in ("_name", "_ident"):
+                assert not hasattr(threading.Thread, attr)
+                setattr(
+                    threading.Thread,
+                    attr,
+                    ThreadNameInterceptor(attr, NativeTracker.registerThreadNameById),
+                )
 
-        NativeTracker.createTracker(
-            move(writer),
-            self._native_traces,
-            self._memory_interval_ms,
-            self._follow_fork,
-            self._trace_python_allocators,
-        )
-        return self
+            self._previous_profile_func = sys.getprofile()
+            self._previous_thread_profile_func = threading._profile_hook
+            threading.setprofile(start_thread_trace)
+
+            if "greenlet" in sys.modules:
+                NativeTracker.beginTrackingGreenlets()
+
+            NativeTracker.createTracker(
+                move(writer),
+                self._native_traces,
+                self._memory_interval_ms,
+                self._follow_fork,
+                self._trace_python_allocators,
+            )
+            return self
 
     @cython.profile(False)
     def __exit__(self, exc_type, exc_value, exc_traceback):
-        NativeTracker.destroyTracker()
-        sys.setprofile(self._previous_profile_func)
-        threading.setprofile(self._previous_thread_profile_func)
+        with tracker_creation_lock:
+            NativeTracker.destroyTracker()
+            sys.setprofile(self._previous_profile_func)
+            threading.setprofile(self._previous_thread_profile_func)
+
+            for attr in ("_name", "_ident"):
+                delattr(threading.Thread, attr)
 
 
 def start_thread_trace(frame, event, arg):
@@ -732,7 +759,7 @@ def print_greenlet_warning():
 
 cdef millis_to_dt(millis):
     return datetime.fromtimestamp(millis // 1000).replace(
-        microsecond=millis % 1000 * 1000)
+        microsecond=millis % 1000 * 1000).astimezone()
 
 
 cdef _create_metadata(header, peak_memory):
@@ -751,8 +778,11 @@ cdef _create_metadata(header, peak_memory):
         peak_memory=peak_memory,
         command_line=header["command_line"],
         pid=header["pid"],
+        main_thread_id=header["main_tid"],
         python_allocator=allocator_id_to_name[header["python_allocator"]],
         has_native_traces=header["native_traces"],
+        trace_python_allocators=header["trace_python_allocators"],
+        file_format=FileFormat(header["file_format"]),
     )
 
 
@@ -806,6 +836,7 @@ cdef class ProgressIndicator:
     def __exit__(self, type, value, traceback):
         if not self._report_progress:
             return
+        self._context_manager.update(self._task, completed=self._cumulative_num_processed)
         return self._context_manager.__exit__(type, value, traceback)
 
     cdef bool _time_for_refresh(self):
@@ -853,16 +884,17 @@ cdef class FileReader:
     cdef HighWatermark _high_watermark
     cdef object _header
     cdef bool _report_progress
+    cdef size_t _memory_snapshot_stride
 
-    def __cinit__(self, object file_name, *, bool report_progress=False):
+    def __cinit__(self, object file_name, *, bool report_progress=False, int max_memory_records=10000):
         try:
             self._file = open(file_name)
         except OSError as exc:
             raise OSError(f"Could not open file {file_name}: {exc.strerror}") from None
 
-        IF UNAME_SYSNAME == "Linux":
+        if platform.system() == "Linux":
             self._path = "/proc/self/fd/" + str(self._file.fileno())
-        ELSE:
+        else:
             self._path = str(file_name)
         self._report_progress = report_progress
 
@@ -879,6 +911,9 @@ cdef class FileReader:
         n_memory_snapshots_approx = 2048
         if 0 < stats["start_time"] < stats["end_time"]:
             n_memory_snapshots_approx = (stats["end_time"] - stats["start_time"]) / 10
+
+        if n_memory_snapshots_approx > max_memory_records:
+            n_memory_snapshots_approx = max_memory_records
         self._memory_snapshots.reserve(n_memory_snapshots_approx)
 
         cdef object total = stats['n_allocations'] or None
@@ -889,6 +924,7 @@ cdef class FileReader:
             total=total,
             report_progress=self._report_progress
         )
+        self._memory_snapshot_stride = 0
         cdef MemoryRecord memory_record
         with progress_indicator:
             while True:
@@ -915,6 +951,10 @@ cdef class FileReader:
                     self._memory_snapshots.push_back(reader.getLatestMemorySnapshot())
                 else:
                     break
+
+        if len(self._memory_snapshots) > max_memory_records:
+            self._memory_snapshot_stride = int(ceil(<double>len(self._memory_snapshots) / max_memory_records))
+            self._memory_snapshots = self._memory_snapshots[::self._memory_snapshot_stride]
         self._high_watermark = finder.getHighWatermark()
         stats["n_allocations"] = progress_indicator.num_processed
 
@@ -1098,6 +1138,7 @@ cdef class FileReader:
 
         cdef AllocationLifetimeAggregator aggregator
         cdef _Allocation allocation
+        cdef int memory_records_seen = 0
 
         with progress_indicator:
             while records_to_process > 0:
@@ -1111,6 +1152,9 @@ cdef class FileReader:
                     records_to_process -= 1
                     progress_indicator.update(1)
                 elif ret == RecordResult.RecordResultMemoryRecord:
+                    memory_records_seen += 1
+                    if self._memory_snapshot_stride and memory_records_seen % self._memory_snapshot_stride != 0:
+                        continue
                     aggregator.captureSnapshot()
                 else:
                     assert ret != RecordResult.RecordResultMemorySnapshot

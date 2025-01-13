@@ -22,3 +22,17 @@ class FlamegraphCommand(HighWatermarkCommand):
             action="store_true",
             default=False,
         )
+
+        parser.add_argument(
+            "--inverted",
+            help="Invert flame graph",
+            action="store_true",
+            default=False,
+        )
+
+        parser.add_argument(
+            "--max-memory-records",
+            help="Maximum number of memory records to display",
+            type=int,
+            default=None,
+        )

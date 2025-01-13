@@ -11,6 +11,7 @@ from memray import AllocationRecord
 from memray import AllocatorType
 from memray import MemorySnapshot
 from memray import Metadata
+from memray.reporters.common import format_thread_name
 
 Location = Tuple[str, str]
 
@@ -28,6 +29,7 @@ class TransformReporter:
         format: str,
         native_traces: bool,
         memory_records: Iterable[MemorySnapshot],
+        **kwargs: Any,
     ) -> None:
         super().__init__()
         self.allocations = allocations
@@ -77,9 +79,14 @@ class TransformReporter:
         metadata: Metadata,
         show_memory_leaks: bool,
         merge_threads: bool,
+        inverted: bool,
     ) -> None:
         if not merge_threads:
             raise NotImplementedError("TransformReporter only supports merged threads.")
+        if inverted:
+            raise NotImplementedError(
+                "TransformReporter does not support inverted argument."
+            )
         renderer = getattr(self, f"render_as_{self.format}")
         renderer(outfile, metadata=metadata, show_memory_leaks=show_memory_leaks)
 
@@ -111,7 +118,7 @@ class TransformReporter:
                     record.n_allocations,
                     record.size,
                     record.tid,
-                    record.thread_name,
+                    format_thread_name(record),
                     "|".join(f"{func};{mod};{line}" for func, mod, line in stack_trace),
                 ]
             )

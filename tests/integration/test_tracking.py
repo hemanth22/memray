@@ -216,7 +216,7 @@ def test_pthread_tracking(tmp_path):
     # GIVEN
     allocator = MemoryAllocator()
 
-    def tracking_function():
+    def tracking_function():  # pragma: no cover
         allocator.valloc(ALLOC_SIZE)
         allocator.free()
 
@@ -1224,7 +1224,7 @@ class TestLeaks:
             records[record.tid].append(record)
         assert len(records.keys()) == 2
         # Each thread should have 4096 bytes total allocations
-        for tid, allocations in records.items():
+        for allocations in records.values():
             assert sum(allocation.size for allocation in allocations) == 4096
 
 
@@ -1448,7 +1448,7 @@ class TestTemporaryAllocations:
             records[record.tid].append(record)
         assert len(records.keys()) == 2
         # Each thread should have 4096 bytes total allocations
-        for tid, allocations in records.items():
+        for allocations in records.values():
             assert sum(allocation.size for allocation in allocations) == 4096
 
     def test_intertwined_temporary_allocations_in_threads(self, tmpdir):
@@ -1522,7 +1522,7 @@ class TestTemporaryAllocations:
             records[record.tid].append(record)
         assert len(records.keys()) == 2
         # Each thread should have 1234 bytes total allocations
-        for _, allocations in records.items():
+        for allocations in records.values():
             assert sum(allocation.size for allocation in allocations) == 1234
 
 
@@ -1539,11 +1539,11 @@ class TestHeader:
 
         monkeypatch.setattr(sys, "argv", ["python", "-m", "pytest"])
         with run_without_tracer():
-            start_time = datetime.datetime.now()
+            start_time = datetime.datetime.now().astimezone()
             with Tracker(output):
                 for _ in range(100):
                     allocator.valloc(1024)
-            end_time = datetime.datetime.now()
+            end_time = datetime.datetime.now().astimezone()
 
         reader = FileReader(output)
         n_records = len(list(reader.get_allocation_records()))
@@ -1570,11 +1570,11 @@ class TestHeader:
         # WHEN
 
         monkeypatch.setattr(sys, "argv", ["python", "-m", "pytest"])
-        start_time = datetime.datetime.now()
+        start_time = datetime.datetime.now().astimezone()
         with Tracker(output):
             for _ in range(100):
                 allocator.valloc(1024)
-        end_time = datetime.datetime.now()
+        end_time = datetime.datetime.now().astimezone()
 
         reader = FileReader(output)
         peak, *_ = list(reader.get_high_watermark_allocation_records())
@@ -1672,6 +1672,34 @@ class TestMemorySnapshots:
             for prev, _next in zip(memory_snapshots, memory_snapshots[1:])
         )
 
+    def test_memory_snapshots_limit_when_reading(self, tmp_path):
+        # GIVEN
+        allocator = MemoryAllocator()
+        output = tmp_path / "test.bin"
+
+        # WHEN
+        with Tracker(output):
+            for _ in range(2):
+                allocator.valloc(ALLOC_SIZE)
+                time.sleep(0.11)
+                allocator.free()
+
+        reader = FileReader(output)
+        memory_snapshots = list(reader.get_memory_snapshots())
+        temporal_records = list(reader.get_temporal_allocation_records())
+
+        assert memory_snapshots
+        n_snapshots = len(memory_snapshots)
+        n_temporal_records = len(temporal_records)
+
+        reader = FileReader(output, max_memory_records=n_snapshots // 2)
+        memory_snapshots = list(reader.get_memory_snapshots())
+        temporal_records = list(reader.get_temporal_allocation_records())
+
+        assert memory_snapshots
+        assert len(memory_snapshots) <= n_snapshots // 2 + 1
+        assert len(temporal_records) <= n_temporal_records // 2 + 1
+
     def test_temporary_allocations_when_filling_vector_without_preallocating(
         self, tmp_path
     ):
@@ -1684,9 +1712,11 @@ class TestMemorySnapshots:
 
         # THEN
         reader = FileReader(output)
-        temporary_allocations = list(
-            reader.get_temporary_allocation_records(threshold=1)
-        )
+        temporary_allocations = [
+            alloc
+            for alloc in reader.get_temporary_allocation_records(threshold=1)
+            if __file__ in alloc.stack_trace()[0][1]
+        ]
         assert elements == 512
         assert len(temporary_allocations) == 1
         (record,) = temporary_allocations
@@ -1706,9 +1736,11 @@ class TestMemorySnapshots:
 
         # THEN
         reader = FileReader(output)
-        temporary_allocations = list(
-            reader.get_temporary_allocation_records(threshold=0)
-        )
+        temporary_allocations = [
+            alloc
+            for alloc in reader.get_temporary_allocation_records(threshold=0)
+            if __file__ in alloc.stack_trace()[0][1]
+        ]
         assert elements == 512
         assert len(temporary_allocations) == 1
         (record,) = temporary_allocations

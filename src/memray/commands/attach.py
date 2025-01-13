@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import os
 import pathlib
+import platform
 import shlex
 import shutil
 import signal
@@ -18,14 +19,48 @@ from memray._errors import MemrayCommandError
 from .live import LiveCommand
 from .run import _get_free_port
 
+try:
+    from typing import Literal
+except ImportError:
+    from typing_extensions import Literal  # type: ignore
+
+TrackingMode = Literal["ACTIVATE", "DEACTIVATE", "FOR_DURATION"]
+
+
 GDB_SCRIPT = pathlib.Path(__file__).parent / "_attach.gdb"
 LLDB_SCRIPT = pathlib.Path(__file__).parent / "_attach.lldb"
 RTLD_DEFAULT = memray._memray.RTLD_DEFAULT
 RTLD_NOW = memray._memray.RTLD_NOW
 PAYLOAD = """
 import atexit
+import time
+import threading
+import resource
+import sys
+from contextlib import suppress
 
 import memray
+
+
+class BareExceptionMessage(Exception):
+    def __repr__(self):
+        return self.args[0]
+
+
+class RepeatingTimer(threading.Thread):
+    def __init__(self, interval, function):
+        self._interval = interval
+        self._function = function
+        self._canceled = threading.Event()
+        super().__init__()
+
+    def cancel(self):
+        self._canceled.set()
+
+    def run(self):
+        while not self._canceled.wait(self._interval):
+            if self._function():
+                break
 
 
 def deactivate_last_tracker():
@@ -34,25 +69,62 @@ def deactivate_last_tracker():
         return
 
     memray._last_tracker = None
-    tracker.__exit__(None, None, None)
+    try:
+        tracker.__exit__(None, None, None)
+    finally:
+        # Clean up resources associated with the Tracker ASAP,
+        # even if an exception was raised.
+        del tracker
+
+    # Stop any waiting threads. This attribute may be unset if an old Memray
+    # version attached 1st, setting last_tracker but not _attach_event_threads.
+    # It could also be unset if we're racing another deactivate call.
+    for thread in memray.__dict__.pop("_attach_event_threads", []):
+        thread.cancel()
+
+
+def activate_tracker():
+    deactivate_last_tracker()
+    tracker = {tracker_call}
+    try:
+        tracker.__enter__()
+        memray._last_tracker = tracker
+    finally:
+        # Clean up resources associated with the Tracker ASAP,
+        # even if an exception was raised.
+        del tracker
+    memray._attach_event_threads = []
+
+
+def track_for_duration(duration=5):
+    activate_tracker()
+
+    def deactivate_because_timer_elapsed():
+        print(
+            "memray: Deactivating tracking:",
+            duration,
+            "seconds have elapsed",
+            file=sys.stderr,
+        )
+        deactivate_last_tracker()
+
+    thread = threading.Timer(duration, deactivate_because_timer_elapsed)
+    thread.start()
+    memray._attach_event_threads.append(thread)
 
 
 if not hasattr(memray, "_last_tracker"):
     # This only needs to be registered the first time we attach.
     atexit.register(deactivate_last_tracker)
 
-deactivate_last_tracker()
-
-tracker = {tracker_call}
-try:
-    tracker.__enter__()
-except:
-    # Prevent the exception from keeping the tracker alive.
-    # This way resources are cleaned up ASAP.
-    del tracker
-    raise
-
-memray._last_tracker = tracker
+if {mode!r} == "ACTIVATE":
+    activate_tracker()
+elif {mode!r} == "DEACTIVATE":
+    if not getattr(memray, "_last_tracker", None):
+        raise BareExceptionMessage("no previous `memray attach` call detected")
+    deactivate_last_tracker()
+elif {mode!r} == "FOR_DURATION":
+    track_for_duration({duration})
 """
 
 
@@ -120,7 +192,10 @@ def inject(debugger: str, pid: int, port: int, verbose: bool) -> str | None:
         print(f"debugger return code: {returncode}")
         print(f"debugger output:\n{output}")
 
-    if returncode == 0 and ' = "SUCCESS"' in output:
+    command_output_lines = (
+        line for line in output.splitlines() if not line.startswith(f"({debugger})")
+    )
+    if returncode == 0 and any(' "SUCCESS"' in line for line in command_output_lines):
         return None
 
     # An error occurred. Give the best message we can. This is hacky; we don't
@@ -219,8 +294,69 @@ class ErrorReaderThread(threading.Thread):
         os.kill(os.getpid(), signal.SIGINT)
 
 
-class AttachCommand:
-    """Remotely monitor allocations in a text-based interface"""
+class _DebuggerCommand:
+    def prepare_parser(self, parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--method",
+            help="Method to use for injecting commands into the remote process",
+            type=str,
+            default="auto",
+            choices=["auto", "gdb", "lldb"],
+        )
+
+        parser.add_argument(
+            "-v",
+            "--verbose",
+            help="Print verbose debugging information.",
+            action="store_true",
+        )
+
+        parser.add_argument(
+            "pid",
+            help="Process id to affect",
+            type=int,
+        )
+
+    def resolve_debugger(self, method: str, *, verbose: bool = False) -> str:
+        if method == "auto":
+            # Prefer gdb on Linux but lldb on macOS
+            if platform.system() == "Linux":
+                debuggers = ("gdb", "lldb")
+            else:
+                debuggers = ("lldb", "gdb")
+
+            for debugger in debuggers:
+                if debugger_available(debugger, verbose=verbose):
+                    return debugger
+            raise MemrayCommandError(
+                "Cannot find a supported lldb or gdb executable.",
+                exit_code=1,
+            )
+        elif not debugger_available(method, verbose=verbose):
+            raise MemrayCommandError(
+                f"Cannot find a supported {method} executable.",
+                exit_code=1,
+            )
+        return method
+
+    def inject_control_channel(
+        self, method: str, pid: int, *, verbose: bool = False
+    ) -> socket.socket:
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        with contextlib.closing(server):
+            server.bind(("localhost", 0))
+            server.listen(1)
+            sidechannel_port = server.getsockname()[1]
+
+            errmsg = inject(method, pid, sidechannel_port, verbose=verbose)
+            if errmsg:
+                raise MemrayCommandError(errmsg, exit_code=1)
+
+            return server.accept()[0]
+
+
+class AttachCommand(_DebuggerCommand):
+    """Begin tracking allocations in an already-started process"""
 
     def prepare_parser(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument(
@@ -241,6 +377,13 @@ class AttachCommand:
         )
 
         parser.add_argument(
+            "--aggregate",
+            help="Write aggregated stats to the output file instead of all allocations",
+            action="store_true",
+            default=False,
+        )
+
+        parser.add_argument(
             "--native",
             help="Track native (C/C++) stack frames as well",
             action="store_true",
@@ -256,7 +399,7 @@ class AttachCommand:
         parser.add_argument(
             "--trace-python-allocators",
             action="store_true",
-            help="Record allocations made by the Pymalloc allocator",
+            help="Record allocations made by the pymalloc allocator",
             default=False,
         )
         compression = parser.add_mutually_exclusive_group()
@@ -274,44 +417,21 @@ class AttachCommand:
         )
 
         parser.add_argument(
-            "--method",
-            help="Method to use for injecting code into the process to track",
-            type=str,
-            default="auto",
-            choices=["auto", "gdb", "lldb"],
+            "--duration", type=int, help="Duration to track for (in seconds)"
         )
 
-        parser.add_argument(
-            "-v",
-            "--verbose",
-            help="Print verbose debugging information.",
-            action="store_true",
-        )
-
-        parser.add_argument(
-            "pid",
-            help="Remote pid to attach to",
-            type=int,
-        )
+        super().prepare_parser(parser)
 
     def run(self, args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         verbose = args.verbose
+        mode: TrackingMode = "ACTIVATE"
+        duration = None
 
-        if args.method == "auto":
-            if debugger_available("lldb", verbose=verbose):
-                args.method = "lldb"
-            elif debugger_available("gdb", verbose=verbose):
-                args.method = "gdb"
-            else:
-                raise MemrayCommandError(
-                    "Cannot find a supported lldb or gdb executable.",
-                    exit_code=1,
-                )
-        elif not debugger_available(args.method, verbose=verbose):
-            raise MemrayCommandError(
-                f"Cannot find a supported {args.method} executable.",
-                exit_code=1,
-            )
+        if args.duration:
+            mode = "FOR_DURATION"
+            duration = args.duration
+
+        args.method = self.resolve_debugger(args.method, verbose=verbose)
 
         destination: memray.Destination
         if args.output:
@@ -325,26 +445,31 @@ class AttachCommand:
             live_port = _get_free_port()
             destination = memray.SocketDestination(server_port=live_port)
 
+        if args.aggregate and not args.output:
+            parser.error("Can't use aggregated mode without an output file.")
+
+        file_format = (
+            "file_format=memray.FileFormat.AGGREGATED_ALLOCATIONS"
+            if args.aggregate
+            else ""
+        )
+
         tracker_call = (
             f"memray.Tracker(destination=memray.{destination!r},"
             f" native_traces={args.native},"
             f" follow_fork={args.follow_fork},"
-            f" trace_python_allocators={args.trace_python_allocators})"
+            f" trace_python_allocators={args.trace_python_allocators},"
+            f"{file_format})"
         )
 
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        with contextlib.closing(server):
-            server.bind(("localhost", 0))
-            server.listen(1)
-            sidechannel_port = server.getsockname()[1]
-
-            errmsg = inject(args.method, args.pid, sidechannel_port, verbose=verbose)
-            if errmsg:
-                raise MemrayCommandError(errmsg, exit_code=1)
-
-            client = server.accept()[0]
-
-        client.sendall(PAYLOAD.format(tracker_call=tracker_call).encode("utf-8"))
+        client = self.inject_control_channel(args.method, args.pid, verbose=verbose)
+        client.sendall(
+            PAYLOAD.format(
+                tracker_call=tracker_call,
+                mode=mode,
+                duration=duration,
+            ).encode("utf-8")
+        )
         client.shutdown(socket.SHUT_WR)
 
         if not live_port:
@@ -384,3 +509,29 @@ class AttachCommand:
                     f"Failed to start tracking in remote process: {remote_err}",
                     exit_code=1,
                 ) from None
+
+
+class DetachCommand(_DebuggerCommand):
+    """End the tracking started by a previous ``memray attach`` call"""
+
+    def run(self, args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+        verbose = args.verbose
+        mode: TrackingMode = "DEACTIVATE"
+        args.method = self.resolve_debugger(args.method, verbose=verbose)
+        client = self.inject_control_channel(args.method, args.pid, verbose=verbose)
+
+        client.sendall(
+            PAYLOAD.format(
+                tracker_call=None,
+                mode=mode,
+                duration=None,
+            ).encode("utf-8")
+        )
+        client.shutdown(socket.SHUT_WR)
+
+        err = recvall(client)
+        if err:
+            raise MemrayCommandError(
+                f"Failed to stop tracking in remote process: {err}",
+                exit_code=1,
+            )

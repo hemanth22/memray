@@ -1,5 +1,19 @@
+From b052eda140ac673de19a3060523fb250d898ffb6 Mon Sep 17 00:00:00 2001
+From: Matt Wozniski <mwozniski@bloomberg.net>
+Date: Thu, 25 Jul 2024 18:59:10 -0400
+Subject: [PATCH] Add debuginfod support to libbacktrace
+
+Allow fetching debug info from a debuginfod server when unwinding.
+---
+ Makefile.am          |   5 +-
+ Makefile.in          |   5 +-
+ debuginfod_support.h | 115 +++++++++++++++++++++++++++++++++++++++++++
+ elf.c                |  64 ++++++++++++++++++++++++
+ 4 files changed, 185 insertions(+), 4 deletions(-)
+ create mode 100644 debuginfod_support.h
+
 diff --git a/Makefile.am b/Makefile.am
-index 998cc67..f065ade 100644
+index f80a9e6..15e87c7 100644
 --- a/Makefile.am
 +++ b/Makefile.am
 @@ -35,7 +35,7 @@ AM_CPPFLAGS =
@@ -19,7 +33,7 @@ index 998cc67..f065ade 100644
  	posix.c \
  	print.c \
  	sort.c \
-@@ -562,7 +563,7 @@ alloc.lo: config.h backtrace.h internal.h
+@@ -685,7 +686,7 @@ alloc.lo: config.h backtrace.h internal.h
  backtrace.lo: config.h backtrace.h internal.h
  btest.lo: filenames.h backtrace.h backtrace-supported.h
  dwarf.lo: config.h filenames.h backtrace.h internal.h
@@ -29,10 +43,10 @@ index 998cc67..f065ade 100644
  macho.lo: config.h backtrace.h internal.h
  mmap.lo: config.h backtrace.h internal.h
 diff --git a/Makefile.in b/Makefile.in
-index dc1e692..5dde684 100644
+index eafad7d..5d9363a 100644
 --- a/Makefile.in
 +++ b/Makefile.in
-@@ -940,7 +940,7 @@ top_srcdir = @top_srcdir@
+@@ -994,7 +994,7 @@ top_srcdir = @top_srcdir@
  ACLOCAL_AMFLAGS = -I config
  AM_CPPFLAGS = 
  AM_CFLAGS = $(EXTRA_FLAGS) $(WARN_FLAGS) $(PIC_FLAG)
@@ -41,7 +55,7 @@ index dc1e692..5dde684 100644
  lib_LTLIBRARIES = libbacktrace.la
  libbacktrace_la_SOURCES = \
  	backtrace.h \
-@@ -948,6 +948,7 @@ libbacktrace_la_SOURCES = \
+@@ -1002,6 +1002,7 @@ libbacktrace_la_SOURCES = \
  	dwarf.c \
  	fileline.c \
  	internal.h \
@@ -49,7 +63,7 @@ index dc1e692..5dde684 100644
  	posix.c \
  	print.c \
  	sort.c \
-@@ -2514,7 +2515,7 @@ alloc.lo: config.h backtrace.h internal.h
+@@ -2794,7 +2795,7 @@ alloc.lo: config.h backtrace.h internal.h
  backtrace.lo: config.h backtrace.h internal.h
  btest.lo: filenames.h backtrace.h backtrace-supported.h
  dwarf.lo: config.h filenames.h backtrace.h internal.h
@@ -60,10 +74,10 @@ index dc1e692..5dde684 100644
  mmap.lo: config.h backtrace.h internal.h
 diff --git a/debuginfod_support.h b/debuginfod_support.h
 new file mode 100644
-index 0000000..8c3674a
+index 0000000..78f4d8d
 --- /dev/null
 +++ b/debuginfod_support.h
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,115 @@
 +/* External declarations for the libdebuginfod client library.
 +   Copyright (C) 2019-2020 Red Hat, Inc.
 +   This file is part of elfutils.
@@ -105,9 +119,6 @@ index 0000000..8c3674a
 +#define DEBUGINFOD_MAXSIZE_ENV_VAR "DEBUGINFOD_MAXSIZE"
 +#define DEBUGINFOD_MAXTIME_ENV_VAR "DEBUGINFOD_MAXTIME"
 +#define DEBUGINFOD_HEADERS_FILE_ENV_VAR "DEBUGINFOD_HEADERS_FILE"
-+
-+/* The libdebuginfod soname.  */
-+#define DEBUGINFOD_SONAME "libdebuginfod.so.1"
 +
 +/* Handle for debuginfod-client connection.  */
 +typedef struct debuginfod_client debuginfod_client;
@@ -183,7 +194,7 @@ index 0000000..8c3674a
 +
 +#endif /* _DEBUGINFOD_CLIENT_H */
 diff --git a/elf.c b/elf.c
-index fb54165..1bc4de0 100644
+index 80482a4..61f08af 100644
 --- a/elf.c
 +++ b/elf.c
 @@ -38,6 +38,7 @@ POSSIBILITY OF SUCH DAMAGE.  */
@@ -193,8 +204,8 @@ index fb54165..1bc4de0 100644
 +#include <dlfcn.h>
  
  #ifdef HAVE_DL_ITERATE_PHDR
- #include <link.h>
-@@ -45,6 +46,7 @@ POSSIBILITY OF SUCH DAMAGE.  */
+  #ifdef HAVE_LINK_H
+@@ -50,6 +51,7 @@ POSSIBILITY OF SUCH DAMAGE.  */
  
  #include "backtrace.h"
  #include "internal.h"
@@ -202,24 +213,11 @@ index fb54165..1bc4de0 100644
  
  #ifndef S_ISLNK
   #ifndef S_IFLNK
-@@ -851,6 +853,82 @@ elf_readlink (struct backtrace_state *state, const char *filename,
+@@ -859,6 +861,39 @@ elf_readlink (struct backtrace_state *state, const char *filename,
  
  #define SYSTEM_BUILD_ID_DIR "/usr/lib/debug/.build-id/"
  
-+typedef debuginfod_client*(*debuginfod_begin_t)(void);
-+
-+typedef int(*debuginfod_find_debuginfo_t)(debuginfod_client *client,
-+                                            const unsigned char *build_id,
-+                                            int build_id_len,
-+                                            char **path);
-+typedef void(*debuginfod_end_t)(debuginfod_client *client);
-+
-+
-+static debuginfod_find_debuginfo_t the_debuginfod_find_debuginfo = NULL;
-+static debuginfod_begin_t the_debuginfod_begin = NULL;
-+static debuginfod_end_t the_debuginfod_end = NULL;
 +static int debuginfod_guard = 0;
-+static int debuginfod_dlopen_failed = 0;
 +
 +static int
 +elf_open_debugfile_by_debuginfod (const char *buildid_data,
@@ -227,47 +225,17 @@ index fb54165..1bc4de0 100644
 +			       backtrace_error_callback error_callback,
 +			       void *data)
 +{
-+  if (debuginfod_dlopen_failed) {
-+      return -1;
-+  }
-+
-+  if (the_debuginfod_find_debuginfo == NULL) {
-+    void *handle = dlopen(DEBUGINFOD_SONAME, RTLD_LAZY);
-+    if (!handle) {
-+      debuginfod_dlopen_failed = 1;
-+      return -1;
-+    }
-+
-+    the_debuginfod_find_debuginfo = (debuginfod_find_debuginfo_t)dlsym(handle, "debuginfod_find_debuginfo");
-+    if (!the_debuginfod_find_debuginfo) {
-+      return -1;
-+    }
-+
-+    the_debuginfod_begin = (debuginfod_begin_t)dlsym(handle, "debuginfod_begin");
-+    if (!the_debuginfod_begin) {
-+      the_debuginfod_find_debuginfo = NULL;
-+      return -1;
-+    }
-+
-+    the_debuginfod_end = (debuginfod_end_t)dlsym(handle, "debuginfod_end");
-+    if (!the_debuginfod_end) {
-+      the_debuginfod_find_debuginfo = NULL;
-+      the_debuginfod_begin = NULL;
-+      return -1;
-+    }
-+  }
-+
 +  char* path = NULL;
 +  const unsigned char* bi = (const unsigned char*)buildid_data;
 +
-+  debuginfod_client* client = the_debuginfod_begin();
++  debuginfod_client* client = debuginfod_begin();
 +  if (!client) {
 +    return -1;
 +  }
 +
-+  const int fd = the_debuginfod_find_debuginfo(client, bi, buildid_size, &path);
++  const int fd = debuginfod_find_debuginfo(client, bi, buildid_size, &path);
 +
-+  the_debuginfod_end(client);
++  debuginfod_end(client);
 +
 +  if (!path || fd <= 0) {
 +    return -1;
@@ -285,7 +253,7 @@ index fb54165..1bc4de0 100644
  /* Open a separate debug info file, using the build ID to find it.
     Returns an open file descriptor, or -1.
  
-@@ -4422,6 +4500,14 @@ elf_add (struct backtrace_state *state, const char *filename, int descriptor,
+@@ -6949,6 +6984,14 @@ elf_add (struct backtrace_state *state, const char *filename, int descriptor,
  
        d = elf_open_debugfile_by_buildid (state, buildid_data, buildid_size,
  					 error_callback, data);
@@ -300,11 +268,10 @@ index fb54165..1bc4de0 100644
        if (d >= 0)
  	{
  	  int ret;
-@@ -4889,7 +4975,29 @@ backtrace_initialize (struct backtrace_state *state, const char *filename,
+@@ -7435,7 +7478,28 @@ backtrace_initialize (struct backtrace_state *state, const char *filename,
    pd.exe_filename = filename;
    pd.exe_descriptor = ret < 0 ? descriptor : -1;
  
-+
 +  /* Here, There Be Dragons: we are about to call dl_iterate_phdr,
 +     which is a glibc-internal function that holds a libc internal
 +     lock. As this function needs to iterate over all the loaded
@@ -330,3 +297,6 @@ index fb54165..1bc4de0 100644
  
    if (!state->threaded)
      {
+-- 
+2.42.3
+

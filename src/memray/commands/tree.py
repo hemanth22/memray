@@ -3,11 +3,9 @@ import os
 from pathlib import Path
 from textwrap import dedent
 
-from rich import print as rprint
-
 from memray import FileReader
 from memray._errors import MemrayCommandError
-from memray._memray import size_fmt
+from memray.commands.common import warn_if_file_is_not_aggregated_and_is_too_big
 from memray.commands.common import warn_if_not_enough_symbols
 from memray.reporters.tree import TreeReporter
 
@@ -20,9 +18,9 @@ class TreeCommand:
         parser.add_argument(
             "-b",
             "--biggest-allocs",
-            help="Show n biggest allocations (defaults to 10)",
+            help="Show n biggest allocations (defaults to 200)",
             type=int,
-            default=10,
+            default=200,
         )
         alloc_type_group = parser.add_mutually_exclusive_group()
         alloc_type_group.add_argument(
@@ -59,6 +57,10 @@ class TreeCommand:
             reader = FileReader(os.fspath(args.results), report_progress=True)
             if reader.metadata.has_native_traces:
                 warn_if_not_enough_symbols()
+
+            if not args.temporary_allocation_threshold >= 0:
+                warn_if_file_is_not_aggregated_and_is_too_big(reader, result_path)
+
             if args.temporary_allocation_threshold >= 0:
                 snapshot = iter(
                     reader.get_temporary_allocation_records(
@@ -80,14 +82,4 @@ class TreeCommand:
                 f"Failed to parse allocation records in {result_path}\nReason: {e}",
                 exit_code=1,
             )
-        print()
-        header = "Allocation metadata"
-        rprint(f"{header}\n{'-'*len(header)}")
-        rprint(f"Command line arguments: '{reader.metadata.command_line}'")
-        rprint(f"Peak memory size: {size_fmt(reader.metadata.peak_memory)}")
-        rprint(f"Number of allocations: {reader.metadata.total_allocations}")
-        print()
-        header = f"Biggest {args.biggest_allocs} allocations:"
-        rprint(header)
-        rprint("-" * len(header))
         reporter.render()

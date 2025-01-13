@@ -1,8 +1,11 @@
-FROM debian:latest
+FROM debian:bookworm-slim
+
+ARG DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update \
     && apt-get install -y --force-yes --no-install-recommends \
     build-essential \
+    libdebuginfod-dev \
     libunwind-dev \
     liblz4-dev \
     pkg-config \
@@ -30,10 +33,11 @@ ENV VIRTUAL_ENV=/venv \
     CC=gcc \
     CXX=g++
 
-RUN python3.9 -m venv "$VIRTUAL_ENV"
+RUN python3 -m venv "$VIRTUAL_ENV"
 
-ENV PATH="${VIRTUAL_ENV}/bin:${PATH}" \
-    PYTHON="${VIRTUAL_ENV}/bin/python"
+ENV PATH="${VIRTUAL_ENV}/bin:/usr/lib/ccache:${PATH}" \
+    PYTHON="${VIRTUAL_ENV}/bin/python" \
+    MEMRAY_MINIMIZE_INLINING="1"
 
 COPY requirements-test.txt requirements-extra.txt requirements-docs.txt /tmp/
 
@@ -42,12 +46,10 @@ RUN $PYTHON -m pip install -U \
     -r /tmp/requirements-test.txt \
     -r /tmp/requirements-docs.txt \
     cython \
+    pkgconfig \
     setuptools \
     wheel
 
 RUN npm install -g prettier
-
-RUN ln -s /usr/bin/ccache /bin/g++ \
-    && ln -s /usr/bin/ccache /bin/gcc
 
 WORKDIR /src

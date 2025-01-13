@@ -290,6 +290,27 @@ class Tracker
         }
     }
 
+    inline static void registerThreadNameById(uint64_t thread, const char* name)
+    {
+        if (RecursionGuard::isActive || !Tracker::isActive()) {
+            return;
+        }
+        RecursionGuard guard;
+
+        std::unique_lock<std::mutex> lock(*s_mutex);
+        Tracker* tracker = getTracker();
+        if (tracker) {
+            if (thread == (uint64_t)(pthread_self())) {
+                tracker->registerThreadNameImpl(name);
+            } else {
+                // We've got a different thread's name, but don't know what id
+                // has been assigned to that thread (if any!). Set this update
+                // aside to be handled later, from that thread.
+                tracker->d_cached_thread_names.emplace(thread, name);
+            }
+        }
+    }
+
     // RawFrame stack interface
     bool pushFrame(const RawFrame& frame);
     bool popFrames(uint32_t count);
@@ -317,6 +338,10 @@ class Tracker
      */
     static void handleGreenletSwitch(PyObject* from, PyObject* to);
 
+    static void prepareFork();
+    static void parentFork();
+    static void childFork();
+
   private:
     class BackgroundThread
     {
@@ -341,6 +366,7 @@ class Tracker
         // Methods
         size_t getRSS() const;
         static unsigned long int timeElapsed();
+        bool captureMemorySnapshot();
     };
 
     // Data members
@@ -358,6 +384,7 @@ class Tracker
     const bool d_trace_python_allocators;
     linker::SymbolPatcher d_patcher;
     std::unique_ptr<BackgroundThread> d_background_thread;
+    std::unordered_map<uint64_t, std::string> d_cached_thread_names;
 
     // Methods
     static size_t computeMainTidSkip();
@@ -372,6 +399,8 @@ class Tracker
     void invalidate_module_cache_impl();
     void updateModuleCacheImpl();
     void registerThreadNameImpl(const char* name);
+    void registerCachedThreadName();
+    void dropCachedThreadName();
     void registerPymallocHooks() const noexcept;
     void unregisterPymallocHooks() const noexcept;
 
@@ -381,10 +410,6 @@ class Tracker
             unsigned int memory_interval,
             bool follow_fork,
             bool trace_python_allocators);
-
-    static void prepareFork();
-    static void parentFork();
-    static void childFork();
 
     static bool areNativeTracesEnabled();
 };

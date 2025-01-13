@@ -11,6 +11,12 @@
 #include "records.h"
 #include "snapshot.h"
 
+#if PY_VERSION_HEX >= 0x030D0000
+// This function still exists in 3.13 but Python.h no longer has its prototype.
+extern "C" const char*
+_PyMem_GetCurrentAllocatorName();
+#endif
+
 namespace memray::tracking_api {
 
 using namespace std::chrono;
@@ -49,7 +55,8 @@ class StreamingRecordWriter : public RecordWriter
     explicit StreamingRecordWriter(
             std::unique_ptr<memray::io::Sink> sink,
             const std::string& command_line,
-            bool native_traces);
+            bool native_traces,
+            bool trace_python_allocators);
 
     StreamingRecordWriter(StreamingRecordWriter& other) = delete;
     StreamingRecordWriter(StreamingRecordWriter&& other) = delete;
@@ -90,7 +97,8 @@ class AggregatingRecordWriter : public RecordWriter
     explicit AggregatingRecordWriter(
             std::unique_ptr<memray::io::Sink> sink,
             const std::string& command_line,
-            bool native_traces);
+            bool native_traces,
+            bool trace_python_allocators);
 
     AggregatingRecordWriter(StreamingRecordWriter& other) = delete;
     AggregatingRecordWriter(StreamingRecordWriter&& other) = delete;
@@ -138,16 +146,22 @@ createRecordWriter(
         std::unique_ptr<memray::io::Sink> sink,
         const std::string& command_line,
         bool native_traces,
-        FileFormat file_format)
+        FileFormat file_format,
+        bool trace_python_allocators)
 {
     switch (file_format) {
         case FileFormat::ALL_ALLOCATIONS:
-            return std::make_unique<StreamingRecordWriter>(std::move(sink), command_line, native_traces);
+            return std::make_unique<StreamingRecordWriter>(
+                    std::move(sink),
+                    command_line,
+                    native_traces,
+                    trace_python_allocators);
         case FileFormat::AGGREGATED_ALLOCATIONS:
             return std::make_unique<AggregatingRecordWriter>(
                     std::move(sink),
                     command_line,
-                    native_traces);
+                    native_traces,
+                    trace_python_allocators);
         default:
             throw std::runtime_error("Invalid file format enumerator");
     }
@@ -156,7 +170,8 @@ createRecordWriter(
 StreamingRecordWriter::StreamingRecordWriter(
         std::unique_ptr<memray::io::Sink> sink,
         const std::string& command_line,
-        bool native_traces)
+        bool native_traces,
+        bool trace_python_allocators)
 : RecordWriter(std::move(sink))
 , d_stats({0, 0, duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count()})
 {
@@ -170,7 +185,8 @@ StreamingRecordWriter::StreamingRecordWriter(
             ::getpid(),
             0,
             0,
-            getPythonAllocator()};
+            getPythonAllocator(),
+            trace_python_allocators};
     strncpy(d_header.magic, MAGIC, sizeof(d_header.magic));
 }
 
@@ -357,7 +373,7 @@ RecordWriter::writeHeaderCommon(const HeaderRecord& header)
         or !writeSimpleType(header.stats) or !writeString(header.command_line.c_str())
         or !writeSimpleType(header.pid) or !writeSimpleType(header.main_tid)
         or !writeSimpleType(header.skipped_frames_on_main_tid)
-        or !writeSimpleType(header.python_allocator))
+        or !writeSimpleType(header.python_allocator) or !writeSimpleType(header.trace_python_allocators))
     {
         return false;
     }
@@ -383,13 +399,15 @@ StreamingRecordWriter::cloneInChildProcess()
     return std::make_unique<StreamingRecordWriter>(
             std::move(new_sink),
             d_header.command_line,
-            d_header.native_traces);
+            d_header.native_traces,
+            d_header.trace_python_allocators);
 }
 
 AggregatingRecordWriter::AggregatingRecordWriter(
         std::unique_ptr<memray::io::Sink> sink,
         const std::string& command_line,
-        bool native_traces)
+        bool native_traces,
+        bool trace_python_allocators)
 : RecordWriter(std::move(sink))
 {
     memcpy(d_header.magic, MAGIC, sizeof(d_header.magic));
@@ -399,6 +417,7 @@ AggregatingRecordWriter::AggregatingRecordWriter(
     d_header.command_line = command_line;
     d_header.pid = ::getpid();
     d_header.python_allocator = getPythonAllocator();
+    d_header.trace_python_allocators = trace_python_allocators;
 
     d_stats.start_time = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
@@ -512,7 +531,8 @@ AggregatingRecordWriter::cloneInChildProcess()
     return std::make_unique<AggregatingRecordWriter>(
             std::move(new_sink),
             d_header.command_line,
-            d_header.native_traces);
+            d_header.native_traces,
+            d_header.trace_python_allocators);
 }
 
 bool

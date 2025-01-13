@@ -17,7 +17,8 @@ namespace {
 struct elf_patcher_context_t
 {
     bool restore_original;
-    std::set<std::string> patched;
+    std::set<std::string>& patched;
+    const std::string& self_so_name;
 };
 
 }  // namespace
@@ -83,8 +84,13 @@ overwrite_elf_table(
         const char* symname = symbols.getSymbolNameByIndex(index);
         auto symbol_addr = relocation.r_offset + base_addr;
 #define FOR_EACH_HOOKED_FUNCTION(hookname)                                                              \
-    if (strcmp(hooks::hookname.d_symbol, symname) == 0) {                                               \
-        patch_symbol(hooks::hookname, &intercept::hookname, symname, symbol_addr, restore_original);    \
+    if (strcmp(MEMRAY_ORIG(hookname).d_symbol, symname) == 0) {                                         \
+        patch_symbol(                                                                                   \
+                MEMRAY_ORIG(hookname),                                                                  \
+                &intercept::hookname,                                                                   \
+                symname,                                                                                \
+                symbol_addr,                                                                            \
+                restore_original);                                                                      \
         continue;                                                                                       \
     }
         MEMRAY_HOOKED_FUNCTIONS
@@ -166,9 +172,11 @@ phdrs_callback(dl_phdr_info* info, [[maybe_unused]] size_t size, void* data) noe
         patched.insert(info->dlpi_name);
     }
 
-    if (strstr(info->dlpi_name, "/ld-linux") || strstr(info->dlpi_name, "linux-vdso.so.1")) {
+    if (strstr(info->dlpi_name, "/ld-linux") || strstr(info->dlpi_name, "/ld-musl")
+        || strstr(info->dlpi_name, "linux-vdso.so.1")
+        || strstr(info->dlpi_name, context.self_so_name.c_str()))
+    {
         // Avoid chaos by not overwriting the symbols in the linker.
-        // TODO: Don't override the symbols in our shared library!
         return 0;
     }
 
@@ -191,14 +199,14 @@ phdrs_callback(dl_phdr_info* info, [[maybe_unused]] size_t size, void* data) noe
 void
 SymbolPatcher::overwrite_symbols() noexcept
 {
-    elf_patcher_context_t context{false, symbols};
+    elf_patcher_context_t context{false, symbols, self_so_name};
     dl_iterate_phdr(&phdrs_callback, (void*)&context);
 }
 
 void
 SymbolPatcher::restore_symbols() noexcept
 {
-    elf_patcher_context_t context{true, symbols};
+    elf_patcher_context_t context{true, symbols, self_so_name};
     dl_iterate_phdr(&phdrs_callback, (void*)&context);
 }
 

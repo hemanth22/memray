@@ -4,15 +4,15 @@
 
 ---
 
-![OS Linux](https://img.shields.io/badge/OS-Linux-blue)
-![OS MacOS](https://img.shields.io/badge/OS-MacOs-blue)
-![PyPI - Python Version](https://img.shields.io/pypi/pyversions/memray)
-![PyPI - Implementation](https://img.shields.io/pypi/implementation/memray)
-![PyPI](https://img.shields.io/pypi/v/memray)
-![PyPI - Downloads](https://img.shields.io/pypi/dm/memray)
+[![OS Linux](https://img.shields.io/badge/OS-Linux-blue)](https://pypi.org/project/memray)
+[![OS MacOS](https://img.shields.io/badge/OS-macOS-blue)](https://pypi.org/project/memray)
+[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/memray)](https://pypi.org/project/memray)
+[![PyPI - Implementation](https://img.shields.io/pypi/implementation/memray)](https://pypi.org/project/memray)
+[![PyPI](https://img.shields.io/pypi/v/memray)](https://pypi.org/project/memray)
+[![PyPI - Downloads](https://img.shields.io/pypi/dm/memray)](https://pypistats.org/packages/memray)
 [![Conda Version](https://img.shields.io/conda/vn/conda-forge/memray.svg)](https://anaconda.org/conda-forge/memray)
 [![Tests](https://github.com/bloomberg/memray/actions/workflows/build.yml/badge.svg)](https://github.com/bloomberg/memray/actions/workflows/build.yml)
-![Code Style](https://img.shields.io/badge/code%20style-black-000000.svg)
+[![Code Style](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
 <p align="center"><img src="https://raw.githubusercontent.com/bloomberg/memray/main/docs/_static/images/output.png" alt="Memray output"></p>
 
@@ -75,10 +75,11 @@ system where you are doing the installation.
 
 If you wish to build Memray from source you need the following binary dependencies in your system:
 
+- libdebuginfod-dev (for Linux)
 - libunwind (for Linux)
 - liblz4
 
-Check your package manager on how to install these dependencies (for example `apt-get install libunwind-dev liblz4-dev` in Debian-based systems
+Check your package manager on how to install these dependencies (for example `apt-get install build-essential python3-dev libdebuginfod-dev libunwind-dev liblz4-dev` in Debian-based systems
 or `brew install lz4` in MacOS). Note that you may need to teach the compiler where to find the header and library files of the dependencies. For
 example, in MacOS with `brew` you may need to run:
 
@@ -152,11 +153,12 @@ positional arguments:
 optional arguments:
   -h, --help            Show this help message and exit
   -v, --verbose         Increase verbosity. Option is additive and can be specified up to 3 times
+  -V, --version         Displays the current version of Memray
 
 Please submit feedback, ideas, and bug reports by filing a new issue at https://github.com/bloomberg/memray/issues
 ```
 
-To use Memray over a script or a single python file you can use
+To use Memray over a script or a single python file you can use:
 
 ```shell
 python3 -m memray run my_script.py
@@ -253,7 +255,7 @@ Reporters display native frames in a different color than Python frames. They ca
 
 # Live mode
 
-<p align="center"><img src="https://raw.githubusercontent.com/bloomberg/memray/main/docs/_static/images/live_animated.gif" alt="Memray output"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/bloomberg/memray/main/docs/_static/images/live_animated.webp" alt="Memray output"></p>
 
 Memray's live mode runs a script or a module in a terminal-based interface that allows you to interactively inspect its memory usage while it runs. This is useful for debugging scripts or modules that take a long time to run or that exhibit multiple complex memory patterns. You can use the `--live` option to run the script or module in live mode:
 
@@ -281,11 +283,13 @@ The results are displayed in descending order of total memory allocated by a fun
 
 - a: Sort by allocation count
 
-The sorted column is highlighted with `< >` characters around the title.
+In most terminals you can also click the "Sort by Total", "Sort by Own", and "Sort by Allocations" buttons on the footer.
+
+The sorted column's heading is underlined.
 
 ## Viewing different threads
 
-By default, the live command will present the main thread of the program. You can look at different threads of the program by pressing the left and right arrow keys.
+By default, the live command will present the main thread of the program. You can look at different threads of the program by pressing the greater than and less than keys, `<` and `>`. In most terminals you can also click the "Previous Thread" and "Next Thread" buttons on the footer.
 
 <img src="https://github.com/bloomberg/memray/blob/main/docs/_static/images/live_different_thread.png?raw=true" align="center"/>
 

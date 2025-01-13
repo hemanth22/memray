@@ -169,7 +169,6 @@ cython_debug/
 memray-*
 
 # VSCode
-.devcontainer
 .vscode
 
 # NodeJS
@@ -177,3 +176,6 @@ node_modules/
 
 # Vendored files
 src/vendor/libbacktrace/install
+
+# pytest-textual-snapshot
+snapshot_report.html

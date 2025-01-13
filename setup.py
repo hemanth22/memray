@@ -8,6 +8,7 @@ import tempfile
 from sys import platform
 from sys import version_info
 
+import pkgconfig
 from Cython.Build import cythonize
 from setuptools import Extension
 from setuptools import find_packages
@@ -91,6 +92,7 @@ install_requires = [
     "jinja2 >= 2.9",
     "typing_extensions; python_version < '3.8.0'",
     "rich >= 11.2.0",
+    "textual >= 0.41.0",
 ]
 docs_requires = [
     "IPython",
@@ -111,10 +113,14 @@ lint_requires = [
 
 test_requires = [
     "Cython",
-    "greenlet; python_version < '3.11'",
+    "greenlet; python_version < '3.14'",
     "pytest",
     "pytest-cov",
     "ipython",
+    "setuptools; python_version >= '3.12'",
+    "pytest-textual-snapshot",
+    "textual >= 0.43, != 0.65.2, != 0.66",
+    "packaging",
 ]
 
 benchmark_requires = [
@@ -209,6 +215,22 @@ if MEMRAY_FAST_TLS:
 BINARY_FORMATS = {"darwin": "macho", "linux": "elf"}
 BINARY_FORMAT = BINARY_FORMATS.get(sys.platform, "elf")
 
+library_flags = {"libraries": ["lz4"]}
+if IS_LINUX:
+    library_flags["libraries"].append("unwind")
+    library_flags["libraries"].append("debuginfod")
+
+try:
+    library_flags = pkgconfig.parse(
+        " ".join(f"lib{libname}" for libname in library_flags["libraries"])
+    )
+except EnvironmentError as e:
+    print("pkg-config not found.", e)
+    print("Falling back to static flags.")
+except pkgconfig.PackageNotFoundError as e:
+    print("Package Not Found", e)
+    print("Falling back to static flags.")
+
 MEMRAY_EXTENSION = Extension(
     name="memray._memray",
     sources=[
@@ -228,20 +250,16 @@ MEMRAY_EXTENSION = Extension(
         "src/memray/_memray/socket_reader_thread.cpp",
         "src/memray/_memray/native_resolver.cpp",
     ],
-    libraries=[
-        "lz4",
-    ],
-    library_dirs=[str(LIBBACKTRACE_LIBDIR)],
-    include_dirs=["src", str(LIBBACKTRACE_INCLUDEDIRS)],
     language="c++",
     extra_compile_args=["-std=c++17", "-Wall", *EXTRA_COMPILE_ARGS],
-    extra_link_args=["-std=c++17", "-lbacktrace", *EXTRA_LINK_ARGS],
+    extra_objects=[str(LIBBACKTRACE_LIBDIR / "libbacktrace.a")],
+    extra_link_args=["-std=c++17", *EXTRA_LINK_ARGS],
     define_macros=DEFINE_MACROS,
     undef_macros=UNDEF_MACROS,
+    **library_flags,
 )
 
-if IS_LINUX:
-    MEMRAY_EXTENSION.libraries.append("unwind")
+MEMRAY_EXTENSION.include_dirs[:0] = ["src", str(LIBBACKTRACE_INCLUDEDIRS)]
 MEMRAY_EXTENSION.libraries.append("dl")
 
 
@@ -296,16 +314,19 @@ setup(
         "License :: OSI Approved :: Apache Software License",
         "Operating System :: POSIX :: Linux",
         "Operating System :: MacOS",
+        "Programming Language :: Python :: 3.7",
         "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
         "Programming Language :: Python :: Implementation :: CPython",
         "Topic :: Software Development :: Debuggers",
     ],
     license="Apache 2.0",
     package_dir={"": "src"},
-    packages=find_packages(where="src"),
+    packages=find_packages(where="src", exclude="memray/_memray/"),
     ext_modules=cythonize(
         [MEMRAY_EXTENSION, MEMRAY_TEST_EXTENSION, MEMRAY_INJECT_EXTENSION],
         include_path=["src/memray"],

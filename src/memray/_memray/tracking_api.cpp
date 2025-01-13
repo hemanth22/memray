@@ -340,7 +340,11 @@ PythonStackTracker::installGreenletTraceFunctionIfNeeded()
     // `greenlet._greenlet` has already been imported.
     PyObject* _greenlet = PyDict_GetItemString(modules, "greenlet._greenlet");
     if (!_greenlet) {
-        return;
+        // Before greenlet 1.0, the extension module was just named "greenlet"
+        _greenlet = PyDict_GetItemString(modules, "greenlet");
+        if (!_greenlet) {
+            return;
+        }
     }
 
     // Borrowed reference
@@ -565,10 +569,6 @@ Tracker::Tracker(
 
         hooks::ensureAllHooksAreValid();
         NativeTrace::setup();
-
-        // We must do this last so that a child can't inherit an environment
-        // where only half of our one-time setup is done.
-        pthread_atfork(&prepareFork, &parentFork, &childFork);
     });
 
     d_writer->setMainTidAndSkippedFrames(thread_id(), computeMainTidSkip());
@@ -603,7 +603,7 @@ Tracker::~Tracker()
         d_patcher.restore_symbols();
     }
 
-    if (Py_IsInitialized() && !_Py_IsFinalizing()) {
+    if (Py_IsInitialized() && !compat::isPythonFinalizing()) {
         PyGILState_STATE gstate;
         gstate = PyGILState_Ensure();
 
@@ -678,10 +678,36 @@ Tracker::BackgroundThread::getRSS() const
 #endif
 }
 
+bool
+Tracker::BackgroundThread::captureMemorySnapshot()
+{
+    auto now = timeElapsed();
+    size_t rss = getRSS();
+    if (rss == 0) {
+        std::cerr << "Failed to detect RSS, deactivating tracking" << std::endl;
+        Tracker::deactivate();
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(*s_mutex);
+    if (!d_writer->writeRecord(MemoryRecord{now, rss})) {
+        std::cerr << "Failed to write output, deactivating tracking" << std::endl;
+        Tracker::deactivate();
+        return false;
+    }
+
+    return true;
+}
+
 void
 Tracker::BackgroundThread::start()
 {
     assert(d_thread.get_id() == std::thread::id());
+
+    if (!captureMemorySnapshot()) {
+        return;
+    }
+
     d_thread = std::thread([&]() {
         RecursionGuard::isActive = true;
         while (true) {
@@ -689,23 +715,12 @@ Tracker::BackgroundThread::start()
                 std::unique_lock<std::mutex> lock(d_mutex);
                 d_cv.wait_for(lock, d_memory_interval * 1ms, [this]() { return d_stop; });
                 if (d_stop) {
-                    break;
+                    return;
                 }
             }
 
-            size_t rss = getRSS();
-            if (rss == 0) {
-                Tracker::deactivate();
-                break;
-            }
-
-            {
-                std::lock_guard<std::mutex> lock(*s_mutex);
-                if (!d_writer->writeRecord(MemoryRecord{timeElapsed(), rss})) {
-                    std::cerr << "Failed to write output, deactivating tracking" << std::endl;
-                    Tracker::deactivate();
-                    break;
-                }
+            if (!captureMemorySnapshot()) {
+                return;
             }
         }
     });
@@ -823,6 +838,7 @@ Tracker::trackAllocationImpl(
         hooks::Allocator func,
         const std::optional<NativeTrace>& trace)
 {
+    registerCachedThreadName();
     PythonStackTracker::get().emitPendingPushesAndPops();
 
     if (d_unwind_native_frames) {
@@ -852,6 +868,7 @@ Tracker::trackAllocationImpl(
 void
 Tracker::trackDeallocationImpl(void* ptr, size_t size, hooks::Allocator func)
 {
+    registerCachedThreadName();
     AllocationRecord record{reinterpret_cast<uintptr_t>(ptr), size, func};
     if (!d_writer->writeThreadSpecificRecord(thread_id(), record)) {
         std::cerr << "Failed to write output, deactivating tracking" << std::endl;
@@ -944,10 +961,35 @@ void
 Tracker::registerThreadNameImpl(const char* name)
 {
     RecursionGuard guard;
+    dropCachedThreadName();
     if (!d_writer->writeThreadSpecificRecord(thread_id(), ThreadRecord{name})) {
         std::cerr << "memray: Failed to write output, deactivating tracking" << std::endl;
         deactivate();
     }
+}
+
+void
+Tracker::registerCachedThreadName()
+{
+    if (d_cached_thread_names.empty()) {
+        return;
+    }
+
+    auto it = d_cached_thread_names.find((uint64_t)(pthread_self()));
+    if (it != d_cached_thread_names.end()) {
+        auto& name = it->second;
+        if (!d_writer->writeThreadSpecificRecord(thread_id(), ThreadRecord{name.c_str()})) {
+            std::cerr << "memray: Failed to write output, deactivating tracking" << std::endl;
+            deactivate();
+        }
+        d_cached_thread_names.erase(it);
+    }
+}
+
+void
+Tracker::dropCachedThreadName()
+{
+    d_cached_thread_names.erase((uint64_t)(pthread_self()));
 }
 
 frame_id_t
@@ -1132,6 +1174,8 @@ PyTraceFunction(
     }
 
     if (frame != PyEval_GetFrame()) {
+        // This should only happen for the phony frames produced by Cython
+        // extension modules that were compiled with `profile=True`.
         return 0;
     }
 
@@ -1172,9 +1216,17 @@ Tracker::beginTrackingGreenlets()
 void
 Tracker::handleGreenletSwitch(PyObject* from, PyObject* to)
 {
+    // We must stop tracking the stack once our trace function is uninstalled.
+    // Otherwise, we'd keep referencing frames after they're destroyed.
+    PyThreadState* ts = PyThreadState_Get();
+    if (ts->c_profilefunc != PyTraceFunction) {
+        return;
+    }
+
     // Grab the Tracker lock, as this may need to write pushes/pops.
     std::unique_lock<std::mutex> lock(*s_mutex);
     RecursionGuard guard;
+
     PythonStackTracker::get().handleGreenletSwitch(from, to);
 }
 

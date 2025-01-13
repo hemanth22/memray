@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from memray import AllocatorType as AT
+from memray._memray import FileFormat
 from memray._metadata import Metadata
 from memray._stats import Stats
 from memray.reporters.stats import StatsReporter
@@ -24,7 +25,7 @@ def _generate_mock_allocations(
     allocators: Optional[List[AT]] = None,
     n_allocations: Optional[List[int]] = None,
     stacks: Optional[List[List[Tuple[str, str, int]]]] = None,
-):
+):  # pragma: no cover
     if sizes is None:
         sizes = []
     if allocators is None:
@@ -51,21 +52,18 @@ def _generate_mock_allocations(
     stacks.extend([default_stacks_value] * (count - len(stacks)))
     stacks = stacks[:count]
 
-    snapshot = []
-    for i in range(count):
-        snapshot.append(
-            MockAllocationRecord(
-                tid=i + 1,
-                address=0x1000000,
-                size=sizes[i],
-                allocator=allocators[i],
-                stack_id=i + 1,
-                n_allocations=n_allocations[i],
-                _stack=stacks[i],
-            )
+    return [
+        MockAllocationRecord(
+            tid=i + 1,
+            address=0x1000000,
+            size=sizes[i],
+            allocator=allocators[i],
+            stack_id=i + 1,
+            n_allocations=n_allocations[i],
+            _stack=stacks[i],
         )
-
-    return snapshot
+        for i in range(count)
+    ]
 
 
 # data generator for tests
@@ -99,6 +97,9 @@ def fake_stats():
             pid=123456,
             python_allocator="pymalloc",
             has_native_traces=False,
+            trace_python_allocators=True,
+            file_format=FileFormat.ALL_ALLOCATIONS,
+            main_thread_id=0x1,
         ),
         total_num_allocations=20,
         total_memory_allocated=sum(mem_allocation_list),
@@ -436,6 +437,9 @@ def test_stats_output_json(fake_stats, tmp_path):
             "pid": 123456,
             "python_allocator": "pymalloc",
             "has_native_traces": False,
+            "trace_python_allocators": True,
+            "file_format": 0,
+            "main_thread_id": 0x1,
         },
     }
     actual = json.loads(output_file.read_text())

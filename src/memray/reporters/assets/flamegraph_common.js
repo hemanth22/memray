@@ -11,6 +11,28 @@ const FILTER_UNINTERESTING = "filter_uninteresting";
 const FILTER_IMPORT_SYSTEM = "filter_import_system";
 const FILTER_THREAD = "filter_thread";
 
+class FilteredChart {
+  constructor() {
+    this.filters = {};
+  }
+  registerFilter(name, func) {
+    this.filters[name] = func;
+  }
+  unRegisterFilter(name) {
+    delete this.filters[name];
+  }
+
+  drawChart(data) {
+    let filtered = data;
+    _.forOwn(this.filters, (func) => {
+      filtered = func(filtered);
+    });
+    drawChart(filtered);
+    // Merge 0 additional elements, triggering a redraw
+    chart.merge([]);
+  }
+}
+
 var chart = null;
 let filteredChart = new FilteredChart();
 
@@ -53,8 +75,11 @@ export function handleFragments() {
 
 // For the invert button
 export function onInvert() {
-  chart.inverted(!chart.inverted());
+  chart.inverted(this === document.getElementById("icicles"));
   chart.resetZoom(); // calls onClick
+
+  // Hide the tooltip for the radio button that was just clicked.
+  $('[data-toggle="tooltip"]').tooltip("hide");
 }
 
 export function onResetZoom() {
@@ -65,28 +90,6 @@ export function onResetZoom() {
 function getChartWidth() {
   // Return the display width of the div we're drawing into
   return document.getElementById("chart").clientWidth;
-}
-
-class FilteredChart {
-  constructor() {
-    this.filters = {};
-  }
-  registerFilter(name, func) {
-    this.filters[name] = func;
-  }
-  unRegisterFilter(name) {
-    delete this.filters[name];
-  }
-
-  drawChart(data) {
-    let filtered = data;
-    _.forOwn(this.filters, (func) => {
-      filtered = func(filtered);
-    });
-    drawChart(filtered);
-    // Merge 0 additional elements, triggering a redraw
-    chart.merge([]);
-  }
 }
 
 export function onResize() {
@@ -140,12 +143,24 @@ export function onFilterImportSystem() {
   }
   if (this.hideImportSystemFrames === true) {
     this.hideImportSystemFrames = true;
-
-    filteredChart.registerFilter(FILTER_IMPORT_SYSTEM, (data) => {
-      return filterImportSystem(data);
-    });
+    if (!inverted) {
+      filteredChart.registerFilter(FILTER_IMPORT_SYSTEM, (data) => {
+        return filterImportSystem(data);
+      });
+    } else {
+      data = invertedNoImportsData;
+      if (temporal) {
+        hideImports = true;
+        intervals = invertedNoImportsIntervals;
+      }
+    }
   } else {
     filteredChart.unRegisterFilter(FILTER_IMPORT_SYSTEM);
+    data = flamegraphData;
+    if (temporal) {
+      hideImports = false;
+      intervals = flamegraphIntervals;
+    }
   }
   this.hideImportSystemFrames = !this.hideImportSystemFrames;
   filteredChart.drawChart(data);
@@ -243,6 +258,9 @@ export function initThreadsDropdown(data, merge_threads) {
 }
 
 export function drawChart(chart_data) {
+  // Retain the "invertedness" if there's an existing graph.
+  let invert = chart ? chart.inverted() : true;
+
   // Clear any existing chart
   if (chart) {
     chart.destroy();
@@ -255,8 +273,7 @@ export function drawChart(chart_data) {
     // smooth transitions
     .transitionDuration(250)
     .transitionEase(d3.easeCubic)
-    // invert the graph by default
-    .inverted(true)
+    .inverted(invert)
     // make each row a little taller
     .cellHeight(20)
     // don't show elements that are less than 5px wide

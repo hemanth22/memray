@@ -20,6 +20,7 @@ from memray import AllocationRecord
 from memray import FileReader
 from memray import MemorySnapshot
 from memray._errors import MemrayCommandError
+from memray._memray import FileFormat
 from memray._memray import SymbolicSupport
 from memray._memray import TemporalAllocationRecord
 from memray._memray import get_symbolic_support
@@ -33,6 +34,7 @@ class ReporterFactory(Protocol):
         *,
         memory_records: Iterable[MemorySnapshot],
         native_traces: bool,
+        inverted: bool,
     ) -> BaseReporter:
         ...
 
@@ -45,6 +47,7 @@ class TemporalReporterFactory(Protocol):
         memory_records: Iterable[MemorySnapshot],
         native_traces: bool,
         high_water_mark_by_snapshot: Optional[List[int]],
+        inverted: bool,
     ) -> BaseReporter:
         ...
 
@@ -73,6 +76,24 @@ def warn_if_not_enough_symbols() -> None:
         )
     else:
         return
+
+
+def warn_if_file_is_not_aggregated_and_is_too_big(
+    reader: FileReader, result_path: Path
+) -> None:
+    FILE_SIZE_LIMIT = 10 * 1000 * 1000
+    if (
+        reader.metadata.file_format == FileFormat.ALL_ALLOCATIONS
+        and result_path.stat().st_size > FILE_SIZE_LIMIT
+    ):
+        pprint(
+            ":warning: [bold yellow] This capture file is large and may take a long"
+            " time to process [/] :warning:\n\n"
+            "Next time, consider using the `--aggregate` option to `memray run` to"
+            " reduce the size of the file.\n"
+            "Check https://bloomberg.github.io/memray/run.html#aggregated-capture-files"
+            " for more information.\n"
+        )
 
 
 class HighWatermarkCommand:
@@ -123,14 +144,23 @@ class HighWatermarkCommand:
         show_memory_leaks: bool,
         temporary_allocation_threshold: int,
         merge_threads: Optional[bool] = None,
+        inverted: Optional[bool] = None,
         temporal: bool = False,
+        max_memory_records: Optional[int] = None,
     ) -> None:
         try:
-            reader = FileReader(os.fspath(result_path), report_progress=True)
+            kwargs = {}
+            if max_memory_records is not None:
+                kwargs["max_memory_records"] = max_memory_records
+            reader = FileReader(os.fspath(result_path), report_progress=True, **kwargs)
             merge_threads = True if merge_threads is None else merge_threads
+            inverted = False if inverted is None else inverted
 
             if reader.metadata.has_native_traces:
                 warn_if_not_enough_symbols()
+
+            if not temporal and not temporary_allocation_threshold >= 0:
+                warn_if_file_is_not_aggregated_and_is_too_big(reader, result_path)
 
             if temporal:
                 assert self.temporal_reporter_factory is not None
@@ -143,6 +173,7 @@ class HighWatermarkCommand:
                         memory_records=tuple(reader.get_memory_snapshots()),
                         native_traces=reader.metadata.has_native_traces,
                         high_water_mark_by_snapshot=None,
+                        inverted=inverted,
                     )
                 else:
                     recs, hwms = reader.get_temporal_high_water_mark_allocation_records(
@@ -153,6 +184,7 @@ class HighWatermarkCommand:
                         memory_records=tuple(reader.get_memory_snapshots()),
                         native_traces=reader.metadata.has_native_traces,
                         high_water_mark_by_snapshot=hwms,
+                        inverted=inverted,
                     )
             else:
                 if show_memory_leaks:
@@ -172,6 +204,7 @@ class HighWatermarkCommand:
                     snapshot,
                     memory_records=tuple(reader.get_memory_snapshots()),
                     native_traces=reader.metadata.has_native_traces,
+                    inverted=inverted,
                 )
         except OSError as e:
             raise MemrayCommandError(
@@ -185,6 +218,7 @@ class HighWatermarkCommand:
                 metadata=reader.metadata,
                 show_memory_leaks=show_memory_leaks,
                 merge_threads=merge_threads,
+                inverted=inverted,
             )
 
     def prepare_parser(self, parser: argparse.ArgumentParser) -> None:
@@ -260,6 +294,12 @@ class HighWatermarkCommand:
         kwargs = {}
         if hasattr(args, "split_threads"):
             kwargs["merge_threads"] = not args.split_threads
+
+        if hasattr(args, "inverted"):
+            kwargs["inverted"] = args.inverted
+
+        if hasattr(args, "max_memory_records"):
+            kwargs["max_memory_records"] = args.max_memory_records
 
         self.write_report(
             result_path,

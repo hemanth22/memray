@@ -10,9 +10,6 @@ on:
   pull_request:
     branches:
       - main
-    paths-ignore:
-      - "docs/**"
-      - "CONTRIBUTING.md"
   release:
     types:
       - published
@@ -30,15 +27,17 @@ jobs:
     strategy:
       fail-fast: false
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.10"
       - name: Set up dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -qy \
+            pkg-config \
+            libdebuginfod-dev \
             libunwind-dev \
             liblz4-dev \
             gdb \
@@ -49,7 +48,7 @@ jobs:
             python3.10-dbg
       - name: Install Python dependencies
         run: |
-          python3 -m pip install --upgrade pip cython
+          python3 -m pip install --upgrade pip cython pkgconfig
           make test-install
       - name: Disable ptrace security restrictions
         run: |
@@ -60,9 +59,18 @@ jobs:
       - name: Compute C++ coverage
         run: |
           make ccoverage
+      - name: Compute Python + Cython coverage
+        run: |
+          make pycoverage
       - name: Upload C++ report to Codecov
-        uses: codecov/codecov-action@v3
+        uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: cppcoverage.lcov
           flags: cpp
+      - name: Upload {P,C}ython report to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: pycoverage.lcov
+          flags: python_and_cython

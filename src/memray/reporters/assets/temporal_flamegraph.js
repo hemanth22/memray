@@ -17,19 +17,22 @@ import {
 var active_plot = null;
 var current_dimensions = null;
 
-var parent_index_by_child_index = (function () {
-  let ret = new Array(packed_data.nodes.children.length);
+var parent_index_by_child_index = generateParentIndexes(packed_data.nodes);
+var inverted_no_imports_parent_index_by_child_index = inverted
+  ? generateParentIndexes(packed_data.inverted_no_imports_nodes)
+  : null;
+
+function generateParentIndexes(nodes) {
+  let ret = new Array(nodes.children.length);
   console.log("finding parent index for each node");
-  for (const [parentIndex, children] of packed_data.nodes.children.entries()) {
+  for (const [parentIndex, children] of nodes.children.entries()) {
     children.forEach((idx) => (ret[idx] = parentIndex));
   }
   console.assert(ret[0] === undefined, "root node has a parent");
   return ret;
-})();
+}
 
-function packedDataToTree(packedData, rangeStart, rangeEnd) {
-  const { strings, nodes, unique_threads } = packedData;
-
+function generateNodeObjects(strings, nodes) {
   console.log("constructing nodes");
   const node_objects = nodes.name.map((_, i) => ({
     name: strings[nodes["name"][i]],
@@ -51,6 +54,83 @@ function packedDataToTree(packedData, rangeStart, rangeEnd) {
     node["children"] = node["children"].map((idx) => node_objects[idx]);
   }
 
+  return node_objects;
+}
+
+function initTrees(packedData) {
+  const {
+    strings,
+    nodes,
+    inverted_no_imports_nodes,
+    unique_threads,
+    intervals,
+    no_imports_interval_list,
+  } = packedData;
+
+  const flamegraphNodeObjects = generateNodeObjects(strings, nodes);
+  const invertedNoImportsNodeObjects = inverted
+    ? generateNodeObjects(strings, inverted_no_imports_nodes)
+    : null;
+
+  flamegraphIntervals = intervals;
+  invertedNoImportsIntervals = no_imports_interval_list;
+
+  return {
+    flamegraphNodeObjects: flamegraphNodeObjects,
+    invertedNoImportsNodeObjects: invertedNoImportsNodeObjects,
+  };
+}
+
+function findHWMAllocations(
+  intervals,
+  node_objects,
+  hwmSnapshot,
+  parent_index_by_child_index,
+) {
+  intervals.forEach((interval) => {
+    let [allocBefore, deallocBefore, nodeIndex, count, bytes] = interval;
+
+    if (
+      allocBefore <= hwmSnapshot &&
+      (deallocBefore === null || deallocBefore > hwmSnapshot)
+    ) {
+      while (nodeIndex !== undefined) {
+        node_objects[nodeIndex].n_allocations += count;
+        node_objects[nodeIndex].value += bytes;
+        nodeIndex = parent_index_by_child_index[nodeIndex];
+      }
+    }
+  });
+}
+
+function findLeakedAllocations(
+  intervals,
+  node_objects,
+  rangeStart,
+  rangeEnd,
+  parent_index_by_child_index,
+) {
+  intervals.forEach((interval) => {
+    let [allocBefore, deallocBefore, nodeIndex, count, bytes] = interval;
+
+    if (
+      allocBefore >= rangeStart &&
+      allocBefore <= rangeEnd &&
+      (deallocBefore === null || deallocBefore > rangeEnd)
+    ) {
+      while (nodeIndex !== undefined) {
+        node_objects[nodeIndex].n_allocations += count;
+        node_objects[nodeIndex].value += bytes;
+        nodeIndex = parent_index_by_child_index[nodeIndex];
+      }
+    }
+  });
+}
+
+function packedDataToTree(packedData, rangeStart, rangeEnd) {
+  const { flamegraphNodeObjects, invertedNoImportsNodeObjects } =
+    initTrees(packedData);
+
   const hwms = packedData.high_water_mark_by_snapshot;
   if (hwms) {
     console.log("finding highest high water mark in range");
@@ -70,71 +150,96 @@ function packedDataToTree(packedData, rangeStart, rangeEnd) {
         " is " +
         hwmBytes +
         " at " +
-        hwmSnapshot
+        hwmSnapshot,
     );
-    Plotly.relayout("plot", {
-      shapes: [
-        {
-          type: "rect",
-          xref: "x",
-          yref: "paper",
-          x0: new Date(memory_records[hwmSnapshot - 1][0]),
-          y0: 0,
-          x1: new Date(memory_records[hwmSnapshot][0]),
-          y1: 1,
-          fillcolor: "#fbff00",
-          opacity: 0.2,
-          line: {
-            width: 0,
-          },
+
+    let plotUpdate = { shapes: [] };
+    let startTime, endTime;
+    if (hwmSnapshot == memory_records.length) {
+      // HWM was after the last snapshot. Highlight 10ms past it.
+      // Widen the x-axis range so the highlight is shown.
+      plotUpdate["xaxis.range[1]"] = new Date(memory_records.at(-1)[0] + 10);
+      startTime = new Date(memory_records.at(-1)[0]);
+      endTime = new Date(memory_records.at(-1)[0] + 10);
+    } else if (hwmSnapshot == 0) {
+      // HWM was before the first snapshot. Highlight 10ms before it.
+      // Widen the x-axis range so the highlight is shown.
+      plotUpdate["xaxis.range[0]"] = new Date(memory_records[0][0] - 10);
+      startTime = new Date(memory_records[0][0] - 10);
+      endTime = new Date(memory_records[0][0]);
+    } else {
+      // HWM was between two snapshots. Highlight from one to the other.
+      startTime = new Date(memory_records[hwmSnapshot - 1][0]);
+      endTime = new Date(memory_records[hwmSnapshot][0]);
+    }
+
+    plotUpdate["shapes"] = [
+      {
+        type: "rect",
+        xref: "x",
+        yref: "paper",
+        x0: startTime,
+        y0: 0,
+        x1: endTime,
+        y1: 1,
+        fillcolor: "#fbff00",
+        opacity: 0.2,
+        line: {
+          width: 0,
         },
-      ],
-    });
+      },
+    ];
+    Plotly.relayout("plot", plotUpdate);
 
     // We could binary search rather than using a linear scan...
     console.log("finding hwm allocations");
-    packedData.intervals.forEach((interval) => {
-      let [allocBefore, deallocBefore, nodeIndex, count, bytes] = interval;
-
-      if (
-        allocBefore <= hwmSnapshot &&
-        (deallocBefore === null || deallocBefore > hwmSnapshot)
-      ) {
-        while (nodeIndex !== undefined) {
-          node_objects[nodeIndex].n_allocations += count;
-          node_objects[nodeIndex].value += bytes;
-          nodeIndex = parent_index_by_child_index[nodeIndex];
-        }
-      }
-    });
+    findHWMAllocations(
+      flamegraphIntervals,
+      flamegraphNodeObjects,
+      hwmSnapshot,
+      parent_index_by_child_index,
+    );
+    if (inverted) {
+      findHWMAllocations(
+        invertedNoImportsIntervals,
+        invertedNoImportsNodeObjects,
+        hwmSnapshot,
+        inverted_no_imports_parent_index_by_child_index,
+      );
+    }
   } else {
     // We could binary search rather than using a linear scan...
     console.log("finding leaked allocations");
-    packedData.intervals.forEach((interval) => {
-      let [allocBefore, deallocBefore, nodeIndex, count, bytes] = interval;
-
-      if (
-        allocBefore >= rangeStart &&
-        allocBefore <= rangeEnd &&
-        (deallocBefore === null || deallocBefore > rangeEnd)
-      ) {
-        while (nodeIndex !== undefined) {
-          node_objects[nodeIndex].n_allocations += count;
-          node_objects[nodeIndex].value += bytes;
-          nodeIndex = parent_index_by_child_index[nodeIndex];
-        }
-      }
-    });
+    findLeakedAllocations(
+      flamegraphIntervals,
+      flamegraphNodeObjects,
+      rangeStart,
+      rangeEnd,
+      parent_index_by_child_index,
+    );
+    if (inverted) {
+      findLeakedAllocations(
+        invertedNoImportsIntervals,
+        invertedNoImportsNodeObjects,
+        rangeStart,
+        rangeEnd,
+        inverted_no_imports_parent_index_by_child_index,
+      );
+    }
   }
 
-  console.log("total allocations in range: " + node_objects[0].n_allocations);
-  console.log("total bytes in range: " + node_objects[0].value);
-
-  node_objects.forEach((node) => {
+  flamegraphNodeObjects.forEach((node) => {
     node.children = node.children.filter((node) => node.n_allocations > 0);
   });
 
-  return node_objects[0];
+  if (inverted) {
+    invertedNoImportsNodeObjects.forEach((node) => {
+      node.children = node.children.filter((node) => node.n_allocations > 0);
+    });
+  }
+
+  flamegraphData = flamegraphNodeObjects[0];
+  invertedNoImportsData = inverted ? invertedNoImportsNodeObjects[0] : null;
 }
 
 function initMemoryGraph(memory_records) {
@@ -142,18 +247,19 @@ function initMemoryGraph(memory_records) {
   const time = memory_records.map((a) => new Date(a[0]));
   const resident_size = memory_records.map((a) => a[1]);
   const heap_size = memory_records.map((a) => a[2]);
+  const mode = memory_records.length > 1 ? "lines" : "markers";
 
   var resident_size_plot = {
     x: time,
     y: resident_size,
-    mode: "lines",
+    mode: mode,
     name: "Resident size",
   };
 
   var heap_size_plot = {
     x: time,
     y: heap_size,
-    mode: "lines",
+    mode: mode,
     name: "Heap size",
   };
 
@@ -238,7 +344,14 @@ function refreshFlamegraph(event) {
   console.log("last possible index is " + memory_records.length);
 
   console.log("constructing tree");
-  data = packedDataToTree(packed_data, idx0, idx1);
+  packedDataToTree(packed_data, idx0, idx1);
+
+  data = inverted && hideImports ? invertedNoImportsData : flamegraphData;
+  intervals =
+    inverted && hideImports ? invertedNoImportsIntervals : flamegraphIntervals;
+
+  console.log("total allocations in range: " + data.n_allocations);
+  console.log("total bytes in range: " + data.value);
 
   console.log("drawing chart");
   getFilteredChart().drawChart(data);
@@ -287,7 +400,7 @@ function main() {
   console.log("main");
 
   const unique_threads = packed_data.unique_threads.map(
-    (tid) => packed_data.strings[tid]
+    (tid) => packed_data.strings[tid],
   );
   initThreadsDropdown({ unique_threads: unique_threads }, merge_threads);
 
@@ -302,7 +415,8 @@ function main() {
   }
 
   // Setup event handlers
-  document.getElementById("invertButton").onclick = onInvert;
+  document.getElementById("icicles").onchange = onInvert;
+  document.getElementById("flames").onchange = onInvert;
   document.getElementById("resetZoomButton").onclick = onResetZoom;
   document.getElementById("resetThreadFilterItem").onclick = onFilterThread;
   let hideUninterestingCheckBox = document.getElementById("hideUninteresting");

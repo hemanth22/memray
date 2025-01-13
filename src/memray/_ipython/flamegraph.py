@@ -18,12 +18,13 @@ from memray.commands.common import warn_if_not_enough_symbols
 from memray.reporters.flamegraph import FlameGraphReporter
 
 TEMPLATE = """\
-from memray import Tracker
+from memray import Tracker, FileFormat
 with Tracker(
     "{dump_file!s}",
     native_traces={native_traces},
     trace_python_allocators={trace_python_allocators},
     follow_fork={follow_fork},
+    file_format=FileFormat.{file_format},
 ) as tracker:
 {code}
 """
@@ -47,7 +48,7 @@ def argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--trace-python-allocators",
         action="store_true",
-        help="Record allocations made by the Pymalloc allocator",
+        help="Record allocations made by the pymalloc allocator",
         default=False,
     )
     alloc_type_group = parser.add_mutually_exclusive_group()
@@ -84,10 +85,34 @@ def argument_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--temporal",
+        help=(
+            "Generate a dynamic flame graph that can analyze"
+            " allocations in a user-selected time range."
+        ),
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
         "--split-threads",
         help="Do not merge allocations across threads",
         action="store_true",
         default=False,
+    )
+    parser.add_argument(
+        "--inverted",
+        help=(
+            "Invert the flame graph: "
+            "use allocators as roots instead of thread entry points"
+        ),
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--max-memory-records",
+        help="Maximum number of memory records to display",
+        type=int,
+        default=None,
     )
 
     return parser
@@ -108,6 +133,15 @@ class FlamegraphMagics(Magics):
             # It already printed a message, just return control to IPython.
             return
 
+        if options.temporal and options.temporary_allocation_threshold >= 0:
+            raise UsageError(
+                "Can't create a temporal flame graph of temporary allocations"
+            )
+        elif options.temporal or options.temporary_allocation_threshold >= 0:
+            file_format = "ALL_ALLOCATIONS"
+        else:
+            file_format = "AGGREGATED_ALLOCATIONS"
+
         results_dir = Path("memray-results")
         results_dir.mkdir(exist_ok=True)
 
@@ -119,6 +153,7 @@ class FlamegraphMagics(Magics):
             trace_python_allocators=options.trace_python_allocators,
             follow_fork=options.follow_fork,
             code=indent(cell, " " * 4),
+            file_format=file_format,
         )
         self.shell.run_cell(code)
 
@@ -126,29 +161,60 @@ class FlamegraphMagics(Magics):
 
         reporter = None
 
-        with FileReader(dump_file, report_progress=True) as reader:
+        kwargs = {}
+        if options.max_memory_records is not None:
+            kwargs["max_memory_records"] = options.max_memory_records
+
+        with FileReader(dump_file, report_progress=True, **kwargs) as reader:
             if reader.metadata.has_native_traces:
                 warn_if_not_enough_symbols()
 
-            if options.show_memory_leaks:
-                snapshot = reader.get_leaked_allocation_records(
-                    merge_threads=merge_threads
-                )
-            elif options.temporary_allocation_threshold >= 0:
-                snapshot = reader.get_temporary_allocation_records(
-                    threshold=options.temporary_allocation_threshold,
-                    merge_threads=merge_threads,
-                )
+            if options.temporal:
+                if options.show_memory_leaks:
+                    temporal_snapshot = reader.get_temporal_allocation_records(
+                        merge_threads=merge_threads
+                    )
+                    reporter = FlameGraphReporter.from_temporal_snapshot(
+                        temporal_snapshot,
+                        memory_records=tuple(reader.get_memory_snapshots()),
+                        native_traces=reader.metadata.has_native_traces,
+                        high_water_mark_by_snapshot=None,
+                        inverted=options.inverted,
+                    )
+                else:
+                    recs, hwms = reader.get_temporal_high_water_mark_allocation_records(
+                        merge_threads=merge_threads
+                    )
+                    reporter = FlameGraphReporter.from_temporal_snapshot(
+                        recs,
+                        memory_records=tuple(reader.get_memory_snapshots()),
+                        native_traces=reader.metadata.has_native_traces,
+                        high_water_mark_by_snapshot=hwms,
+                        inverted=options.inverted,
+                    )
             else:
-                snapshot = reader.get_high_watermark_allocation_records(
-                    merge_threads=merge_threads
+                if options.show_memory_leaks:
+                    snapshot = reader.get_leaked_allocation_records(
+                        merge_threads=merge_threads
+                    )
+                elif options.temporary_allocation_threshold >= 0:
+                    snapshot = reader.get_temporary_allocation_records(
+                        threshold=options.temporary_allocation_threshold,
+                        merge_threads=merge_threads,
+                    )
+                else:
+                    snapshot = reader.get_high_watermark_allocation_records(
+                        merge_threads=merge_threads
+                    )
+
+                memory_records = tuple(reader.get_memory_snapshots())
+                reporter = FlameGraphReporter.from_snapshot(
+                    snapshot,
+                    memory_records=memory_records,
+                    native_traces=options.native,
+                    inverted=options.inverted,
                 )
-            memory_records = tuple(reader.get_memory_snapshots())
-            reporter = FlameGraphReporter.from_snapshot(
-                snapshot,
-                memory_records=memory_records,
-                native_traces=options.native,
-            )
+
         assert reporter is not None
         flamegraph_path = Path(tempdir) / "flamegraph.html"
         with open(flamegraph_path, "w") as f:
@@ -157,6 +223,7 @@ class FlamegraphMagics(Magics):
                 metadata=reader.metadata,
                 show_memory_leaks=options.show_memory_leaks,
                 merge_threads=merge_threads,
+                inverted=options.inverted,
             )
         dump_file.unlink()
         pprint(f"Results saved to [bold cyan]{flamegraph_path}")

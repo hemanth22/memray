@@ -8,6 +8,220 @@ Changelog
 
 .. towncrier release notes start
 
+memray 1.15.0 (2024-12-03)
+--------------------------
+
+Bug Fixes
+~~~~~~~~~
+
+- Fix some crashes caused by interposing symbols in memray itself (#685)
+- Fixed a bug that was causing tracking of runtime libraries that are part of the linker cache not work in macOS 15. (#693)
+- Fix a crash when a greenlet switch happens after Memray's profile function has been deactivated or replaced. (#700)
+
+
+memray 1.14.0 (2024-09-09)
+--------------------------
+
+Features
+~~~~~~~~
+
+- Wheels are now published for Python 3.13, though we don't yet support free-threaded (no GIL) builds. (#658)
+
+
+Bug Fixes
+~~~~~~~~~
+
+- Fix a lock ordering deadlock in libc between a Memray lock and a lock internal to dlopen. (#549)
+- Ensure flame graphs stay in flame mode when the user has selected it.
+  Previously clicking the "Hide Irrelevant Frames" or "Hide Import System Frames"
+  checkboxes would switch the flame graph back to icicle mode. (#656)
+- Fix a race condition that was able to cause strange exception messages if two different threads tried to initialize Memray tracking at once. (#667)
+
+
+memray 1.13.4 (2024-07-18)
+--------------------------
+
+Bug Fixes
+~~~~~~~~~
+
+- A backwards-incompatible change released in Textual 0.73 caused the ``memray tree`` reporter to start with no nodes expanded. This release adds a workaround to restore the old behavior of expanding the first child of each node. (#648)
+
+
+memray 1.13.3 (2024-07-02)
+--------------------------
+
+Bug Fixes
+~~~~~~~~~
+
+- Fix a bug that could result in truncated reports for applications that fork without calling :c:func:`PyOS_BeforeFork`, including by using `multiprocessing` with the "spawn" start method (the default on macOS). (#644)
+
+
+memray 1.13.2 (2024-06-27)
+--------------------------
+
+Bug Fixes
+~~~~~~~~~
+
+- Fix a bug that could in rare circumstances result in a stack overflow while processing native mode stacks. (#639)
+
+
+Miscellaneous
+~~~~~~~~~~~~~
+
+- Upgrade our vendored copy of ``libbacktrace``, used for reporting native stacks, to the latest version. (#639)
+
+
+memray 1.13.1 (2024-06-23)
+--------------------------
+
+Bug Fixes
+~~~~~~~~~
+
+- Fix a deadlock that could occur on some Linux systems when resolving debug information using debuginfod. (#634)
+
+
+memray 1.13.0 (2024-06-18)
+--------------------------
+
+Features
+~~~~~~~~
+
+- Add :doc:`a tutorial <tutorials/index>` to the Memray documentation. (#590)
+- Include the thread name in the live TUI. (#562)
+- Capture the name attribute of Python `threading.Thread` objects. (#562)
+- Allow using Ctrl+Z to suspend ``memray tree`` and the live mode TUI. (#581)
+- Add a button in the live-mode TUI to show allocations from all threads at once. (#589)
+- Vendor ``libdebuginfod`` into our Linux wheels, so that debuginfod integration can be used without any dependency on system-installed libraries. (#592)
+
+
+Bug Fixes
+~~~~~~~~~
+
+- Fix dynamic toggling between descriptions like "Pause" vs "Unpause" or "Show" vs "Hide" in the footer of the live-mode TUI and tree reporter. This was broken by changes introduced in Textual 0.61 (and again by Textual 0.63). (#597)
+- Correctly localize the start and end time in the "Stats" modal when an HTML report was generated on a different machine than the one it is being displayed on. (#611)
+- Fix a crash in old macOS versions (<11.0) due to the inavailability of some linker cache APIs. (#615)
+- Fix reporting of "Own Memory" in the ``live`` and ``summary`` reporters. A bug in our summation caused us to undercount functions' direct allocations. (#617)
+
+
+Miscellaneous
+~~~~~~~~~~~~~
+
+- Builds from source now work for Python 3.13. Wheels are not yet published for 3.13 because it is not yet ABI stable. (#622)
+- Link our Linux wheels against the latest version of ``elfutils``. (#592)
+
+
+memray 1.12.0 (2024-03-07)
+--------------------------
+
+Features
+~~~~~~~~
+
+- Allow ``--temporal`` and ``--max-memory-records`` to be used with our :ref:`Jupyter magic <Jupyter integration>`. (#538)
+- Automatically use aggregated capture files for the :ref:`Jupyter magic <Jupyter integration>` whenever possible, reducing the amount of disk space needed for temporary files. (#538)
+- Expose the main thread id in the FileReader's metadata attribute. (#560)
+
+
+Bug Fixes
+~~~~~~~~~
+
+- Fix a bug that was causing ``dlopen`` to not load shared libraries that have an RPATH/RUNPATH set. (#525)
+- Fix a bug where the tree reporter would fail to populate the code pane with relevant lines if the line where the allocation occurred was too near the start of the file. (#544)
+- Fix a bug causing the first entry of ``sys.path`` to be erroneously overwritten by ``memray run`` when the Python interpreter was launched with the ``-I`` or ``-P`` flag, or when the ``PYTHONSAFEPATH`` environment variable was set. (#552)
+
+
+memray 1.11.0 (2023-12-04)
+--------------------------
+
+Features
+~~~~~~~~
+
+- Migrate the  :doc:`live TUI <live>` to Textual. This provides a greatly improved user experience, including the ability to scroll to view rows that don't fit on the screen. (#274)
+- Add a new documentation page to serve as :ref:`an overview of memory concepts <memory overview>`, to help users better interpret the memory profiles provided by Memray. (#496)
+- Where possible, leverage ``pkg-config`` when building the extension from source, picking up appropriate compiler and linker flags automatically. (#498)
+- Port the tree reporter to be an interactive Textual App. (#499)
+
+
+Bug Fixes
+~~~~~~~~~
+
+- Fixed a bug that caused ``memray attach`` to fail with newer LLDB versions, including on macOS Sonoma. (#490)
+- Limit the number of memory records displayed in reporters by default. This will help displaying flamegraphs for long capture sessions. (#491)
+- When generating a ``--leaks`` flamegraph, don't show a warning that the ``pymalloc`` allocator is in use if ``--trace-python-allocators`` was used when generating the capture file. (#492)
+- Ensure that we update our terminal progress bars to 100% when processing finishes. (#494)
+
+
+memray 1.10.0 (2023-10-05)
+--------------------------
+
+Features
+~~~~~~~~
+
+- Add support for :ref:`inverted flame graphs`. In an inverted flame graph, the
+  roots are the functions that allocated memory, and the children of any given
+  node represent the percentage of that node's allocations that can be attributed
+  to a particular caller. The inverted flame graph is very helpful in analyzing
+  where memory is being spent in aggregate. You can generate one by passing the
+  ``--inverted`` flag to ``memray flamegraph``. (#439)
+- ``memray attach`` now supports ``--aggregate`` to produce :ref:`aggregated capture files <aggregated capture files>`. (#455)
+- ``memray attach`` has been enhanced to allow tracking for only a set period of
+  time. (#458)
+- A new ``memray detach`` command allows you to manually deactivate tracking that
+  was started by a previous call to ``memray attach``. (#458)
+- Python 3.12 is now supported. (#474)
+
+
+Bug Fixes
+~~~~~~~~~
+
+- Update ``memray attach`` on Linux to prefer GDB over LLDB for injecting itself into the process being attached to. We've had several reports of problems with the Linux LLDB, and hope this change will help give Linux users a better experience by default. You can still explicitly use LLDB on Linux even when GDB is detected by running ``memray attach --method=lldb``. (#449)
+- Fix a memory leak in Memray itself when many different capture files are opened by a single Memray process and native stacks are being reported. This issue primarily affected ``pytest-memray``. (#473)
+- Fix a crash in MacOS Sonoma when using system Framework libraries, like when using the ``pyobjc`` library. (#477)
+
+
+memray 1.9.1 (2023-08-01)
+-------------------------
+
+Bug Fixes
+~~~~~~~~~
+
+- Fix an issue that stopped Memray's experimental support for ``greenlet`` from working with versions of the ``greenlet`` module older than 1.0. (#432)
+- Fix a bug leading to a deadlock when Memray is used to profile an application that uses the jemalloc implementation of ``malloc``. (#433)
+- Fix a bug causing the ``summary`` reporter to generate empty reports. (#435)
+
+
+memray 1.9.0 (2023-07-28)
+-------------------------
+
+Features
+~~~~~~~~
+
+- Allow to report the current version of Memray via a ``--version/-V`` command line parameter (#420)
+- Add pause/unpause keybindings to the live reporter that allows the user to pause the live reporter to analyse the current results without pausing the running program (#418)
+
+
+Bug Fixes
+~~~~~~~~~
+
+- Support building with Cython 3 (#425)
+
+
+memray 1.8.1 (2023-06-20)
+-------------------------
+
+Features
+~~~~~~~~
+
+- When the high water mark being shown by a temporal flame graph is before the first memory snapshot or after the last one, tell the user so by highlighting a region beyond the end of the memory usage plot. (#399)
+
+
+Bug Fixes
+~~~~~~~~~
+
+- Prevent a totally empty memory plot from being shown on flame graphs when the tracked process completes before any periodic memory snapshots are captured. (#399)
+- Fix a bug that prevented the temporal high water mark flame graph from showing the flame graph of a high water mark that occurred after the final periodic memory snapshot was captured. (#399)
+- Fix a bug that prevented Memray from intercepting functions in shared objects that are part of the dyld shared cache in macOS Ventura. (#401)
+
+
 memray 1.8.0 (2023-06-09)
 -------------------------
 

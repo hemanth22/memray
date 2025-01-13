@@ -42,9 +42,29 @@ function packedDataToTree(packedData) {
   return root;
 }
 
+function initTrees(packedData) {
+  const { strings, nodes, inverted_no_imports_nodes, unique_threads } =
+    packedData;
+  flamegraphData = packedDataToTree({
+    strings: strings,
+    nodes: nodes,
+    unique_threads: unique_threads,
+  });
+
+  invertedNoImportsData = inverted
+    ? packedDataToTree({
+        strings: strings,
+        nodes: inverted_no_imports_nodes,
+        unique_threads: unique_threads,
+      })
+    : null;
+
+  data = flamegraphData;
+}
+
 // Main entrypoint
 function main() {
-  data = packedDataToTree(packed_data);
+  initTrees(packed_data);
   initMemoryGraph(memory_records);
   initThreadsDropdown(data, merge_threads);
 
@@ -57,7 +77,8 @@ function main() {
   }
 
   // Setup event handlers
-  document.getElementById("invertButton").onclick = onInvert;
+  document.getElementById("icicles").onchange = onInvert;
+  document.getElementById("flames").onchange = onInvert;
   document.getElementById("resetZoomButton").onclick = onResetZoom;
   document.getElementById("resetThreadFilterItem").onclick = onFilterThread;
   let hideUninterestingCheckBox = document.getElementById("hideUninteresting");
@@ -80,6 +101,10 @@ function main() {
   window.addEventListener("popstate", handleFragments);
   window.addEventListener("resize", debounced(onResize));
 
+  let statsStartTime = document.getElementById("stats-start-time");
+  let statsEndTime = document.getElementById("stats-end-time");
+  statsStartTime.textContent = new Date(statsStartTime.innerText);
+  statsEndTime.textContent = new Date(statsEndTime.innerText);
   // Enable tooltips
   $('[data-toggle-second="tooltip"]').tooltip();
   $('[data-toggle="tooltip"]').tooltip();

@@ -1,5 +1,7 @@
 #include <cassert>
 #include <cstdio>
+#include <mutex>
+#include <unordered_set>
 
 #include "hooks.h"
 #include "tracking_api.h"
@@ -88,14 +90,14 @@ isDeallocator(const Allocator& allocator)
     __builtin_unreachable();
 }
 
-#define FOR_EACH_HOOKED_FUNCTION(f) SymbolHook<decltype(&::f)> f(#f, &::f);
+#define FOR_EACH_HOOKED_FUNCTION(f) SymbolHook<decltype(&::f)> MEMRAY_ORIG_NO_NS(f)(#f, &::f);
 MEMRAY_HOOKED_FUNCTIONS
 #undef FOR_EACH_HOOKED_FUNCTION
 
 void
 ensureAllHooksAreValid()
 {
-#define FOR_EACH_HOOKED_FUNCTION(f) f.ensureValidOriginalSymbol();
+#define FOR_EACH_HOOKED_FUNCTION(f) MEMRAY_ORIG(f).ensureValidOriginalSymbol();
     MEMRAY_HOOKED_FUNCTIONS
 #undef FOR_EACH_HOOKED_FUNCTION
 }
@@ -164,17 +166,23 @@ pymalloc_free(void* ctx, void* ptr) noexcept
 void*
 malloc(size_t size) noexcept
 {
-    assert(hooks::malloc);
+    assert(MEMRAY_ORIG(malloc));
 
-    void* ptr = hooks::malloc(size);
-    tracking_api::Tracker::trackAllocation(ptr, size, hooks::Allocator::MALLOC);
+    void* ptr;
+    {
+        tracking_api::RecursionGuard guard;
+        ptr = MEMRAY_ORIG(malloc)(size);
+    }
+    if (ptr) {
+        tracking_api::Tracker::trackAllocation(ptr, size, hooks::Allocator::MALLOC);
+    }
     return ptr;
 }
 
 void
 free(void* ptr) noexcept
 {
-    assert(hooks::free);
+    assert(MEMRAY_ORIG(free));
 
     // We need to call our API before we call the real free implementation
     // to make sure that the pointer is not reused in-between.
@@ -182,18 +190,21 @@ free(void* ptr) noexcept
         tracking_api::Tracker::trackDeallocation(ptr, 0, hooks::Allocator::FREE);
     }
 
-    hooks::free(ptr);
+    {
+        tracking_api::RecursionGuard guard;
+        MEMRAY_ORIG(free)(ptr);
+    }
 }
 
 void*
 realloc(void* ptr, size_t size) noexcept
 {
-    assert(hooks::realloc);
+    assert(MEMRAY_ORIG(realloc));
 
     void* ret;
     {
         tracking_api::RecursionGuard guard;
-        ret = hooks::realloc(ptr, size);
+        ret = MEMRAY_ORIG(realloc)(ptr, size);
     }
     if (ret) {
         if (ptr != nullptr) {
@@ -207,12 +218,12 @@ realloc(void* ptr, size_t size) noexcept
 void*
 calloc(size_t num, size_t size) noexcept
 {
-    assert(hooks::calloc);
+    assert(MEMRAY_ORIG(calloc));
 
     void* ret;
     {
         tracking_api::RecursionGuard guard;
-        ret = hooks::calloc(num, size);
+        ret = MEMRAY_ORIG(calloc)(num, size);
     }
     if (ret) {
         tracking_api::Tracker::trackAllocation(ret, num * size, hooks::Allocator::CALLOC);
@@ -223,9 +234,15 @@ calloc(size_t num, size_t size) noexcept
 void*
 mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset) noexcept
 {
-    assert(hooks::mmap);
-    void* ptr = hooks::mmap(addr, length, prot, flags, fd, offset);
-    tracking_api::Tracker::trackAllocation(ptr, length, hooks::Allocator::MMAP);
+    assert(MEMRAY_ORIG(mmap));
+    void* ptr;
+    {
+        tracking_api::RecursionGuard guard;
+        ptr = MEMRAY_ORIG(mmap)(addr, length, prot, flags, fd, offset);
+    }
+    if (ptr != MAP_FAILED) {
+        tracking_api::Tracker::trackAllocation(ptr, length, hooks::Allocator::MMAP);
+    }
     return ptr;
 }
 
@@ -233,9 +250,15 @@ mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset) noexc
 void*
 mmap64(void* addr, size_t length, int prot, int flags, int fd, off64_t offset) noexcept
 {
-    assert(hooks::mmap64);
-    void* ptr = hooks::mmap64(addr, length, prot, flags, fd, offset);
-    tracking_api::Tracker::trackAllocation(ptr, length, hooks::Allocator::MMAP);
+    assert(MEMRAY_ORIG(mmap64));
+    void* ptr;
+    {
+        tracking_api::RecursionGuard guard;
+        ptr = MEMRAY_ORIG(mmap64)(addr, length, prot, flags, fd, offset);
+    }
+    if (ptr != MAP_FAILED) {
+        tracking_api::Tracker::trackAllocation(ptr, length, hooks::Allocator::MMAP);
+    }
     return ptr;
 }
 #endif
@@ -243,20 +266,23 @@ mmap64(void* addr, size_t length, int prot, int flags, int fd, off64_t offset) n
 int
 munmap(void* addr, size_t length) noexcept
 {
-    assert(hooks::munmap);
+    assert(MEMRAY_ORIG(munmap));
     tracking_api::Tracker::trackDeallocation(addr, length, hooks::Allocator::MUNMAP);
-    return hooks::munmap(addr, length);
+    {
+        tracking_api::RecursionGuard guard;
+        return MEMRAY_ORIG(munmap)(addr, length);
+    }
 }
 
 void*
 valloc(size_t size) noexcept
 {
-    assert(hooks::valloc);
+    assert(MEMRAY_ORIG(valloc));
 
     void* ret;
     {
         tracking_api::RecursionGuard guard;
-        ret = hooks::valloc(size);
+        ret = MEMRAY_ORIG(valloc)(size);
     }
     if (ret) {
         tracking_api::Tracker::trackAllocation(ret, size, hooks::Allocator::VALLOC);
@@ -267,12 +293,12 @@ valloc(size_t size) noexcept
 int
 posix_memalign(void** memptr, size_t alignment, size_t size) noexcept
 {
-    assert(hooks::posix_memalign);
+    assert(MEMRAY_ORIG(posix_memalign));
 
     int ret;
     {
         tracking_api::RecursionGuard guard;
-        ret = hooks::posix_memalign(memptr, alignment, size);
+        ret = MEMRAY_ORIG(posix_memalign)(memptr, alignment, size);
     }
     if (!ret) {
         tracking_api::Tracker::trackAllocation(*memptr, size, hooks::Allocator::POSIX_MEMALIGN);
@@ -283,15 +309,80 @@ posix_memalign(void** memptr, size_t alignment, size_t size) noexcept
 void*
 dlopen(const char* filename, int flag) noexcept
 {
-    assert(hooks::dlopen);
-    void* ret;
+    assert(MEMRAY_ORIG(dlopen));
+    void* ret = nullptr;
     {
         tracking_api::RecursionGuard guard;
-        ret = hooks::dlopen(filename, flag);
+#if defined(__GLIBC__)
+        // In GLIBC, dlopen() will respect the RPATH/RUNPATH of the caller when searching for the
+        // library, which won't work if we intercept dlopen() as we will be the caller. This means that
+        // callers that rely on RUNPATH to find their dependencies will fail to load. To work around
+        // this, we need to manually find our caller and walk the linker search path to know what we need
+        // to dlopen().
+        if (filename != nullptr && filename[0] != '\0' && std::strchr(filename, '/') == nullptr) {
+            void* const callerAddr = __builtin_extract_return_addr(__builtin_return_address(0));
+
+            Dl_info info;
+            if (dladdr(callerAddr, &info)) {
+                const char* dlname = info.dli_fname;
+                {
+                    // Check if we are being called from the main executable
+                    Dl_info main_info;
+                    void* main_sym = NULL;
+                    void* self_handle = MEMRAY_ORIG(dlopen)(nullptr, RTLD_LAZY | RTLD_NOLOAD);
+                    if (self_handle) {
+                        main_sym = dlsym(self_handle, "main");
+                        MEMRAY_ORIG(dlclose)(self_handle);
+                    }
+                    if (main_sym && dladdr(main_sym, &main_info)
+                        && strcmp(main_info.dli_fname, info.dli_fname) == 0)
+                    {
+                        dlname = nullptr;
+                    }
+                }
+
+                void* caller = MEMRAY_ORIG(dlopen)(dlname, RTLD_LAZY | RTLD_NOLOAD);
+                if (caller != nullptr) {
+                    Dl_serinfo size;
+                    if (dlinfo(caller, RTLD_DI_SERINFOSIZE, &size) == 0) {
+                        std::vector<char> paths_buf;
+                        paths_buf.resize(size.dls_size);
+                        auto paths = reinterpret_cast<Dl_serinfo*>(paths_buf.data());
+                        *paths = size;
+                        if (dlinfo(caller, RTLD_DI_SERINFO, paths) == 0) {
+                            for (unsigned int i = 0; i != paths->dls_cnt; ++i) {
+                                const char* name = paths->dls_serpath[i].dls_name;
+                                if (name == nullptr || name[0] == '\0') {
+                                    continue;
+                                }
+                                std::string dir = name;
+                                if (dir.back() != '/') {
+                                    dir += '/';
+                                }
+
+                                dir += filename;
+                                ret = MEMRAY_ORIG(dlopen)(dir.c_str(), flag);
+                                if (ret) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    MEMRAY_ORIG(dlclose)(caller);
+                }
+            }
+        }
+#endif
+        // Fallback if we found nothing
+        if (ret == nullptr) {
+            ret = MEMRAY_ORIG(dlopen)(filename, flag);
+        }
     }
     if (ret) {
         tracking_api::Tracker::invalidate_module_cache();
-        if (filename && nullptr != strstr(filename, "/_greenlet.")) {
+        if (filename
+            && (nullptr != strstr(filename, "/_greenlet.") || nullptr != strstr(filename, "/greenlet.")))
+        {
             tracking_api::Tracker::beginTrackingGreenlets();
         }
     }
@@ -301,9 +392,13 @@ dlopen(const char* filename, int flag) noexcept
 int
 dlclose(void* handle) noexcept
 {
-    assert(hooks::dlclose);
+    assert(MEMRAY_ORIG(dlclose));
 
-    int ret = hooks::dlclose(handle);
+    int ret;
+    {
+        tracking_api::RecursionGuard guard;
+        ret = MEMRAY_ORIG(dlclose)(handle);
+    }
     tracking_api::NativeTrace::flushCache();
     if (!ret) tracking_api::Tracker::invalidate_module_cache();
     return ret;
@@ -312,12 +407,12 @@ dlclose(void* handle) noexcept
 void*
 aligned_alloc(size_t alignment, size_t size) noexcept
 {
-    assert(hooks::aligned_alloc);
+    assert(MEMRAY_ORIG(aligned_alloc));
 
     void* ret;
     {
         tracking_api::RecursionGuard guard;
-        ret = hooks::aligned_alloc(alignment, size);
+        ret = MEMRAY_ORIG(aligned_alloc)(alignment, size);
     }
     if (ret) {
         tracking_api::Tracker::trackAllocation(ret, size, hooks::Allocator::ALIGNED_ALLOC);
@@ -330,12 +425,12 @@ aligned_alloc(size_t alignment, size_t size) noexcept
 void*
 memalign(size_t alignment, size_t size) noexcept
 {
-    assert(hooks::memalign);
+    assert(MEMRAY_ORIG(memalign));
 
     void* ret;
     {
         tracking_api::RecursionGuard guard;
-        ret = hooks::memalign(alignment, size);
+        ret = MEMRAY_ORIG(memalign)(alignment, size);
     }
     if (ret) {
         tracking_api::Tracker::trackAllocation(ret, size, hooks::Allocator::MEMALIGN);
@@ -347,9 +442,13 @@ memalign(size_t alignment, size_t size) noexcept
 void*
 pvalloc(size_t size) noexcept
 {
-    assert(hooks::pvalloc);
+    assert(MEMRAY_ORIG(pvalloc));
 
-    void* ret = hooks::pvalloc(size);
+    void* ret;
+    {
+        tracking_api::RecursionGuard guard;
+        ret = MEMRAY_ORIG(pvalloc)(size);
+    }
     if (ret) {
         tracking_api::Tracker::trackAllocation(ret, size, hooks::Allocator::PVALLOC);
     }
@@ -373,7 +472,7 @@ prctl(int option, ...) noexcept
         tracking_api::Tracker::registerThreadName(name);
     }
 
-    unsigned long ret = hooks::prctl(option, args[0], args[1], args[2], args[3]);
+    unsigned long ret = MEMRAY_ORIG(prctl)(option, args[0], args[1], args[2], args[3]);
 
     return ret;
 }
@@ -382,7 +481,7 @@ prctl(int option, ...) noexcept
 PyGILState_STATE
 PyGILState_Ensure() noexcept
 {
-    PyGILState_STATE ret = hooks::PyGILState_Ensure();
+    PyGILState_STATE ret = MEMRAY_ORIG(PyGILState_Ensure)();
     tracking_api::install_trace_function();
     return ret;
 }
